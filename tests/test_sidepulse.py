@@ -38,6 +38,7 @@ from sidepulse.collector import (
     MonitorSnapshot,
     SourceSpec,
     default_sources,
+    mode_for_event,
 )
 from sidepulse.cli import build_parser, visible_watch_statuses
 from sidepulse.device_writer import (
@@ -53,9 +54,11 @@ from sidepulse.install import (
     hook_command,
     install_claude_hooks,
     install_codex_hooks,
+    install_copilot_hooks,
     install_grok_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
+    uninstall_copilot_hooks,
     uninstall_grok_hooks,
     update_codex_trusted_hashes,
 )
@@ -63,6 +66,7 @@ from sidepulse.keep_awake import KeepAwakeController, status_file_for_target
 from sidepulse.led_status import (
     AgentLedController,
     LedDisplayState,
+    apply_brightness,
     display_state_for_mode,
     led_count_for_target,
     program_for_display_state,
@@ -84,6 +88,7 @@ from sidepulse.lid_sleep import (
 from sidepulse.models import AgentMode, AgentStatus, AggregateStatus
 from sidepulse.origin import ProcessInfo, origin_from_processes
 from sidepulse.providers import (
+    detect_copilot_config,
     detect_grok_config,
     default_log_path,
     default_state_dir,
@@ -331,11 +336,70 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(record)
+        assert record is not None
         self.assertEqual(record.event_name, "PreToolUse")
         self.assertEqual(record.session_id, "grok-session")
         self.assertEqual(record.cwd, "/tmp/project")
         self.assertEqual(record.tool_name, "run_terminal_command")
         self.assertEqual(record.raw["tool_input"], {"command": "date"})
+
+    def test_copilot_log_line_normalizes_hook_payload(self) -> None:
+        record = parse_log_line(
+            "copilot",
+            json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "copilot-session",
+                    "timestamp": "2026-08-29T20:00:00Z",
+                    "cwd": "/tmp/project",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "pytest"},
+                }
+            ),
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.provider, "copilot")
+        self.assertEqual(record.session_id, "copilot-session")
+        self.assertEqual(record.tool_name, "Bash")
+        self.assertEqual(record.event_name, "PreToolUse")
+        self.assertEqual(record.cwd, "/tmp/project")
+
+    def test_copilot_notifications_and_errors_map_to_actionable_modes(self) -> None:
+        permission = parse_log_line(
+            "copilot",
+            json.dumps(
+                {
+                    "hook_event_name": "Notification",
+                    "session_id": "copilot-session",
+                    "timestamp": "2026-08-29T20:00:00Z",
+                    "cwd": "/tmp/project",
+                    "notification_type": "permission_prompt",
+                    "message": "Permission needed",
+                }
+            ),
+        )
+        recoverable_error = parse_log_line(
+            "copilot",
+            json.dumps(
+                {
+                    "hook_event_name": "ErrorOccurred",
+                    "session_id": "copilot-session",
+                    "timestamp": "2026-08-29T20:00:01Z",
+                    "cwd": "/tmp/project",
+                    "recoverable": True,
+                    "error": {"name": "RetryError", "message": "retrying"},
+                }
+            ),
+        )
+
+        self.assertIsNotNone(permission)
+        self.assertIsNotNone(recoverable_error)
+        assert permission is not None
+        assert recoverable_error is not None
+        self.assertEqual(mode_for_event(permission), AgentMode.WAITING_FOR_INPUT)
+        self.assertEqual(mode_for_event(recoverable_error), AgentMode.WORKING)
 
     def test_claude_compat_grok_payload_is_inferred_as_grok(self) -> None:
         record = parse_log_line(
@@ -2834,6 +2898,50 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertIn("matcher", data["hooks"]["PreToolUse"][-1])
             self.assertNotIn("matcher", data["hooks"]["SessionStart"][-1])
 
+    def test_copilot_installer_writes_user_hook_file_and_preserves_other_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "hooks" / "sidepulse.json"
+            log = base / "copilot.jsonl"
+            config.parent.mkdir()
+            config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "hooks": {
+                            "PreToolUse": [
+                                {
+                                    "type": "command",
+                                    "bash": "echo keep >> /tmp/other.log",
+                                },
+                                {
+                                    "type": "command",
+                                    "bash": f"jq -c . >> {log}",
+                                },
+                            ]
+                        },
+                    }
+                )
+            )
+
+            result = install_copilot_hooks(
+                log_path=log,
+                config_path=config,
+                python_executable="python3",
+            )
+
+            self.assertTrue(result.changed)
+            data = json.loads(config.read_text())
+            commands = [entry["bash"] for entry in data["hooks"]["PreToolUse"]]
+            self.assertIn("echo keep >> /tmp/other.log", commands)
+            self.assertTrue(any("--provider copilot" in command for command in commands))
+            self.assertFalse(any(command.startswith("jq -c") for command in commands))
+            self.assertIn("SessionStart", data["hooks"])
+            self.assertIn("ErrorOccurred", data["hooks"])
+            self.assertNotIn("PermissionRequest", data["hooks"])
+            self.assertNotIn("SubagentStart", data["hooks"])
+            self.assertTrue(all(entry["timeoutSec"] == 5 for entry in data["hooks"]["Stop"]))
+
     def test_grok_installer_removes_legacy_sidepulse_hook_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -3018,6 +3126,43 @@ class AgentMonitorTests(unittest.TestCase):
             ]
             self.assertEqual(commands, ["echo keep >> /tmp/other.log"])
 
+    def test_copilot_uninstaller_removes_monitor_hooks_and_preserves_other_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "hooks" / "sidepulse.json"
+            log = base / "copilot.jsonl"
+            config.parent.mkdir()
+            config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "hooks": {
+                            "PreToolUse": [
+                                {
+                                    "type": "command",
+                                    "bash": "echo keep >> /tmp/other.log",
+                                }
+                            ]
+                        },
+                    }
+                )
+            )
+            install_copilot_hooks(
+                log_path=log,
+                config_path=config,
+                python_executable="python3",
+            )
+
+            result = uninstall_copilot_hooks(log_path=log, config_path=config)
+
+            self.assertTrue(result.changed)
+            data = json.loads(config.read_text())
+            self.assertEqual(
+                data["hooks"]["PreToolUse"],
+                [{"type": "command", "bash": "echo keep >> /tmp/other.log"}],
+            )
+            self.assertNotIn("SessionStart", data["hooks"])
+
     def test_grok_uninstaller_removes_legacy_sidepulse_hook_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -3067,6 +3212,25 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertIn("PreToolUse", detected.hook_events)
             self.assertIn(log, detected.log_paths)
 
+    def test_detect_copilot_config_reads_managed_hook_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = home / ".copilot" / "hooks" / "sidepulse.json"
+            log = home / "state" / "copilot.jsonl"
+            install_copilot_hooks(
+                log_path=log,
+                config_path=config,
+                python_executable="python3",
+            )
+
+            detected = detect_copilot_config(home)
+
+            self.assertEqual(detected.provider, "copilot")
+            self.assertTrue(detected.exists)
+            self.assertTrue(detected.hooks_enabled)
+            self.assertIn("PreToolUse", detected.hook_events)
+            self.assertIn(log, detected.log_paths)
+
     def test_sidepulse_sidepulse_command_shape(self) -> None:
         parser = build_parser(prog="sidepulse agent-monitor")
 
@@ -3078,9 +3242,14 @@ class AgentMonitorTests(unittest.TestCase):
         status_bar_foreground = parser.parse_args(["status-bar", "--foreground"])
         grok_install = parser.parse_args(["install", "grok"])
         grok_hook_log = parser.parse_args(["hook-log", "--provider", "grok", "--log", "/tmp/grok.jsonl"])
+        copilot_install = parser.parse_args(["install", "copilot"])
+        copilot_hook_log = parser.parse_args(
+            ["hook-log", "--provider", "copilot", "--log", "/tmp/copilot.jsonl"]
+        )
 
         self.assertEqual(install.provider, "all")
         self.assertEqual(grok_install.provider, "grok")
+        self.assertEqual(copilot_install.provider, "copilot")
         self.assertEqual(live.command, "live")
         self.assertEqual(live.recent_seconds, 120)
         self.assertEqual(leds.command, "leds")
@@ -3092,6 +3261,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertFalse(status_bar.uninstall)
         self.assertTrue(status_bar_foreground.foreground)
         self.assertEqual(grok_hook_log.provider, "grok")
+        self.assertEqual(copilot_hook_log.provider, "copilot")
         self.assertIn("sidepulse agent-monitor", parser.format_usage())
 
     def test_sidepulse_entrypoint_dispatches_to_sidepulse(self) -> None:
@@ -3303,6 +3473,13 @@ class AgentMonitorTests(unittest.TestCase):
             changed=True,
             backup_path=None,
         )
+        copilot_result = SimpleNamespace(
+            provider="copilot",
+            config_path=Path("/tmp/copilot-hook.json"),
+            log_path=Path("/tmp/copilot.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
         launch_result = SimpleNamespace(
             plist_path=Path("/tmp/io.sidepulse.agentstatus.plist"),
             changed=True,
@@ -3323,6 +3500,11 @@ class AgentMonitorTests(unittest.TestCase):
             patch.object(cli_module, "install_codex_hooks", return_value=codex_result) as codex,
             patch.object(cli_module, "install_claude_hooks", return_value=claude_result) as claude,
             patch.object(cli_module, "install_grok_hooks", return_value=grok_result) as grok,
+            patch.object(
+                cli_module,
+                "install_copilot_hooks",
+                return_value=copilot_result,
+            ) as copilot,
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
                 return_value=guard_result,
@@ -3338,6 +3520,7 @@ class AgentMonitorTests(unittest.TestCase):
         codex.assert_called_once()
         claude.assert_called_once()
         grok.assert_called_once()
+        copilot.assert_called_once()
         guard.assert_called_once_with(scope="auto", dry_run=False)
         launch.assert_called_once_with(start=True)
 
@@ -3499,13 +3682,17 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(
             program_for_display_state(LedDisplayState.IDLE),
-            "off\n#020204 6s pulse\nrepeat",
+            "brightness 204\noff\n#020204 6s pulse\nrepeat",
         )
-        self.assertEqual(program_for_display_state(LedDisplayState.DONE), "#00FF66")
+        self.assertEqual(
+            program_for_display_state(LedDisplayState.DONE),
+            "brightness 204\n#00FF66",
+        )
         self.assertIn("#FF3A00 1.6s pulse", program_for_display_state(LedDisplayState.ASK))
         self.assertEqual(
             program_for_display_state(LedDisplayState.WORKING, led_count=2).splitlines(),
             [
+                "brightness 204",
                 "off 160ms cosine",
                 "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms",
                 "repeat",
@@ -3513,12 +3700,13 @@ class AgentMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             len(program_for_display_state(LedDisplayState.WORKING, led_count=8).splitlines()),
-            3,
+            4,
         )
         self.assertEqual(
             program_for_display_state(LedDisplayState.DONE, brightness=128),
             "brightness 128\n#00FF66",
         )
+        self.assertEqual(apply_brightness("#00FF66", 255), "#00FF66")
 
     def test_write_mode_to_leds_uses_device_specific_program(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3531,6 +3719,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(result.target, device / "LEDS.LED")
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
+                "brightness 204\n"
                 "off 160ms cosine\n"
                 "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms\n"
                 "repeat",
@@ -3540,7 +3729,7 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
-                "off\n#020204 6s pulse\nrepeat",
+                "brightness 204\noff\n#020204 6s pulse\nrepeat",
             )
 
             write_mode_to_leds(AgentMode.COMPLETED, device_path=device, brightness=64)
@@ -3559,11 +3748,12 @@ class AgentMonitorTests(unittest.TestCase):
             write_mode_to_leds(AgentMode.WORKING, device_path=device)
 
             lines = (device / "LEDS.LED").read_text().splitlines()
-            self.assertEqual(len(lines), 3)
-            self.assertEqual(lines[0], "off 160ms cosine")
-            self.assertIn("0:#00E5FF 760ms pulse 0ms", lines[1])
-            self.assertIn("5:#00E5FF 760ms pulse 475ms", lines[1])
-            self.assertIn("7:#00E5FF 760ms pulse 665ms", lines[1])
+            self.assertEqual(len(lines), 4)
+            self.assertEqual(lines[0], "brightness 204")
+            self.assertEqual(lines[1], "off 160ms cosine")
+            self.assertIn("0:#00E5FF 760ms pulse 0ms", lines[2])
+            self.assertIn("5:#00E5FF 760ms pulse 475ms", lines[2])
+            self.assertIn("7:#00E5FF 760ms pulse 665ms", lines[2])
             self.assertEqual(lines[-1], "repeat")
 
     def test_agent_led_controller_skips_unchanged_state(self) -> None:
@@ -3631,11 +3821,12 @@ class AgentMonitorTests(unittest.TestCase):
 
         validate_led_text(program)
         lines = program.splitlines()
-        self.assertIn(f"0:{BATTERY_CHARGING_MINT} 360ms ease", lines[0])
-        self.assertIn(f"3:{BATTERY_CHARGING_MINT} 360ms ease", lines[0])
-        self.assertIn("4:#000000 360ms ease", lines[0])
-        self.assertEqual(lines[1], f"4:{BATTERY_CHARGING_MINT} 790ms pulse")
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], "brightness 204")
+        self.assertIn(f"0:{BATTERY_CHARGING_MINT} 360ms ease", lines[1])
+        self.assertIn(f"3:{BATTERY_CHARGING_MINT} 360ms ease", lines[1])
+        self.assertIn("4:#000000 360ms ease", lines[1])
+        self.assertEqual(lines[2], f"4:{BATTERY_CHARGING_MINT} 790ms pulse")
+        self.assertEqual(len(lines), 3)
         self.assertNotIn("repeat", program)
         self.assertNotIn("\noff", program)
 
@@ -3645,7 +3836,7 @@ class AgentMonitorTests(unittest.TestCase):
         program = program_for_battery(snapshot, led_count=8)
 
         validate_led_text(program)
-        self.assertEqual(len(program.splitlines()), 1)
+        self.assertEqual(len(program.splitlines()), 2)
         self.assertIn("0:#FFB000 360ms ease", program)
         self.assertIn("3:#FFB000 360ms ease", program)
         self.assertIn("4:#000000 360ms ease", program)
@@ -3657,7 +3848,7 @@ class AgentMonitorTests(unittest.TestCase):
         program = program_for_battery(snapshot, led_count=8)
 
         validate_led_text(program)
-        segments = program.split(";")
+        segments = program.splitlines()[-1].split(";")
         self.assertEqual(segments[0], "0:#00FF66 360ms ease")
         self.assertEqual(segments[3], "3:#00FF66 360ms ease")
         self.assertEqual(segments[4], "4:#008F39 360ms ease")
@@ -4307,6 +4498,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("codex", providers)
         self.assertIn("claude", providers)
         self.assertIn("grok", providers)
+        self.assertIn("copilot", providers)
         self.assertNotIn("codex-transcripts", providers)
         self.assertNotIn("claude-transcripts", providers)
 
@@ -4363,6 +4555,20 @@ class AgentMonitorTests(unittest.TestCase):
             loaded = load_settings(settings_path)
 
             self.assertEqual(loaded.brightness_for_device("/Volumes/SidePulseDot"), 96)
+
+    def test_settings_preserve_explicit_full_brightness(self) -> None:
+        settings = AgentMonitorSettings(
+            devices=(
+                DeviceDisplaySetting(
+                    device_id="/Volumes/SidePulseDot",
+                    name="SidePulse Dot",
+                    path="/Volumes/SidePulseDot",
+                    brightness=255,
+                ),
+            )
+        )
+
+        self.assertEqual(settings.brightness_for_device("/Volumes/SidePulseDot"), 255)
 
     def test_settings_round_trip_session_open_preferences(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4514,7 +4720,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         self.assertEqual(remembered.display_for_device("/Volumes/SidePulseDot"), "battery")
-        self.assertEqual(remembered.brightness_for_device("/Volumes/SidePulseDot"), 255)
+        self.assertEqual(remembered.brightness_for_device("/Volumes/SidePulseDot"), 204)
 
     def test_settings_remove_remembered_device(self) -> None:
         settings = AgentMonitorSettings(
@@ -6441,6 +6647,23 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
         self.assertEqual(
             session_resume_command(status),
             "cd '/tmp/project with spaces' && codex resume 019ee395-2f64-7cc3-b566-afcc1d626160",
+        )
+
+    def test_copilot_session_actions_build_resume_command(self) -> None:
+        status = AgentStatus(
+            provider="copilot",
+            agent_id="copilot:session:abc",
+            display_name="GitHub Copilot abc",
+            mode=AgentMode.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            event_name="Stop",
+            session_id="copilot-session",
+            cwd="/tmp/project with spaces",
+        )
+
+        self.assertEqual(
+            session_resume_command(status),
+            "cd '/tmp/project with spaces' && copilot --resume=copilot-session",
         )
 
     def test_session_default_open_action_follows_origin(self) -> None:

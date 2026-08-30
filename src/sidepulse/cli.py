@@ -22,9 +22,11 @@ from .hook import hook_log_main
 from .install import (
     install_claude_hooks,
     install_codex_hooks,
+    install_copilot_hooks,
     install_grok_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
+    uninstall_copilot_hooks,
     uninstall_grok_hooks,
 )
 from .led_status import AgentLedController, LedStatusWrite
@@ -39,6 +41,7 @@ from .providers import (
     HOOK_PROVIDERS,
     detect_claude_config,
     detect_codex_config,
+    detect_copilot_config,
     detect_grok_config,
     detect_log_path,
     default_log_path,
@@ -97,6 +100,7 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     setup.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     setup.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     setup.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    setup.add_argument("--copilot-log", type=Path, help="GitHub Copilot JSONL log path.")
     setup.add_argument("--dry-run", action="store_true", help="Show what would change.")
     setup.add_argument(
         "--sd-eject-guard-scope",
@@ -639,20 +643,28 @@ def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
     )
     status_bar.set_defaults(func=cmd_status_bar)
 
-    install = subparsers.add_parser("install", help="Install Codex, Claude, and/or Grok monitor hooks.")
+    install = subparsers.add_parser(
+        "install",
+        help="Install monitor hooks for supported AI agents.",
+    )
     install.add_argument("provider", choices=("all", *HOOK_PROVIDERS), nargs="?", default="all")
     install.add_argument("--log-dir", type=Path, help="Directory for provider JSONL files.")
     install.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     install.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     install.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    install.add_argument("--copilot-log", type=Path, help="GitHub Copilot JSONL log path.")
     install.add_argument("--dry-run", action="store_true", help="Show what would change.")
     install.set_defaults(func=cmd_install)
 
-    uninstall = subparsers.add_parser("uninstall", help="Remove Codex, Claude, and/or Grok monitor hooks.")
+    uninstall = subparsers.add_parser(
+        "uninstall",
+        help="Remove monitor hooks for supported AI agents.",
+    )
     uninstall.add_argument("provider", choices=("all", *HOOK_PROVIDERS), nargs="?", default="all")
     uninstall.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     uninstall.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     uninstall.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    uninstall.add_argument("--copilot-log", type=Path, help="GitHub Copilot JSONL log path.")
     uninstall.add_argument("--dry-run", action="store_true", help="Show what would change.")
     uninstall.set_defaults(func=cmd_uninstall)
 
@@ -694,10 +706,16 @@ def add_status_args(parser: argparse.ArgumentParser, include_json: bool = True) 
     parser.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     parser.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     parser.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    parser.add_argument("--copilot-log", type=Path, help="GitHub Copilot JSONL log path.")
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    configs = [detect_codex_config(), detect_claude_config(), detect_grok_config()]
+    configs = [
+        detect_codex_config(),
+        detect_claude_config(),
+        detect_grok_config(),
+        detect_copilot_config(),
+    ]
     payload = {"providers": [config.to_dict() for config in configs]}
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -816,8 +834,10 @@ def install_hook_results(args: argparse.Namespace):
             results.append(install_codex_hooks(log_path=log_path, dry_run=args.dry_run))
         elif provider == "claude":
             results.append(install_claude_hooks(log_path=log_path, dry_run=args.dry_run))
-        else:
+        elif provider == "grok":
             results.append(install_grok_hooks(log_path=log_path, dry_run=args.dry_run))
+        else:
+            results.append(install_copilot_hooks(log_path=log_path, dry_run=args.dry_run))
     return results
 
 
@@ -842,8 +862,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             results.append(uninstall_codex_hooks(log_path=log_path, dry_run=args.dry_run))
         elif provider == "claude":
             results.append(uninstall_claude_hooks(log_path=log_path, dry_run=args.dry_run))
-        else:
+        elif provider == "grok":
             results.append(uninstall_grok_hooks(log_path=log_path, dry_run=args.dry_run))
+        else:
+            results.append(uninstall_copilot_hooks(log_path=log_path, dry_run=args.dry_run))
 
     for result in results:
         action = "would remove" if args.dry_run and result.changed else "removed"

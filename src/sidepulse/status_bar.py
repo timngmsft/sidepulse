@@ -94,13 +94,16 @@ from .ipc import HookEventServer, default_event_socket_path, default_latest_stat
 from .install import (
     install_claude_hooks,
     install_codex_hooks,
+    install_copilot_hooks,
     install_grok_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
+    uninstall_copilot_hooks,
     uninstall_grok_hooks,
 )
 from .led_status import (
     AgentLedController,
+    DEFAULT_LED_BRIGHTNESS,
     apply_brightness,
     brightness_percent,
     normalize_brightness,
@@ -124,6 +127,7 @@ from .providers import (
     ProviderConfig,
     detect_claude_config,
     detect_codex_config,
+    detect_copilot_config,
     detect_grok_config,
     default_state_dir,
     parse_log_line,
@@ -198,7 +202,7 @@ class StatusBarDevice:
     target: Path
     connected: bool
     display: str
-    brightness: int = 255
+    brightness: int = DEFAULT_LED_BRIGHTNESS
     reason: str = ""
 
 
@@ -678,6 +682,14 @@ class StatusBarController(NSObject):
         self.update_hooks("grok", install=False)
 
     @objc.IBAction
+    def installCopilotHooks_(self, _sender):
+        self.update_hooks("copilot", install=True)
+
+    @objc.IBAction
+    def uninstallCopilotHooks_(self, _sender):
+        self.update_hooks("copilot", install=False)
+
+    @objc.IBAction
     def toggleCodexTranscripts_(self, sender):
         self.set_transcript_monitoring("codex", sender.state() == NSOnState)
 
@@ -978,6 +990,7 @@ class StatusBarController(NSObject):
         codex = detect_codex_config()
         claude = detect_claude_config()
         grok = detect_grok_config()
+        copilot = detect_copilot_config()
         set_field_value(
             self.settings_fields.get("codex_hook_status"),
             hook_status_text(codex),
@@ -989,6 +1002,10 @@ class StatusBarController(NSObject):
         set_field_value(
             self.settings_fields.get("grok_hook_status"),
             hook_status_text(grok),
+        )
+        set_field_value(
+            self.settings_fields.get("copilot_hook_status"),
+            hook_status_text(copilot),
         )
         set_field_value(
             self.settings_fields.get("settings_path"),
@@ -1165,10 +1182,14 @@ class StatusBarController(NSObject):
                 result = install_claude_hooks()
             elif provider == "claude":
                 result = uninstall_claude_hooks()
-            elif install:
+            elif provider == "grok" and install:
                 result = install_grok_hooks()
-            else:
+            elif provider == "grok":
                 result = uninstall_grok_hooks()
+            elif install:
+                result = install_copilot_hooks()
+            else:
+                result = uninstall_copilot_hooks()
         except Exception as exc:
             self.set_settings_message(f"{provider.title()} hooks failed: {exc}")
             self.refresh_settings_window()
@@ -3217,7 +3238,7 @@ def rect_parts(rect) -> tuple[float, float, float, float]:
 
 def build_settings_window(target: StatusBarController) -> NSWindow:
     width = 680
-    height = 560
+    height = 594
     style = (
         NSWindowStyleMaskTitled
         | NSWindowStyleMaskClosable
@@ -3275,21 +3296,26 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     )
     content.addSubview_(tab_view)
 
-    add_label(agents_tab, "Agent Hooks", 24, 398, 200, 24)
-    add_label(agents_tab, "Codex", 32, 360, 80, 22)
-    codex_status = add_label(agents_tab, "", 130, 360, 240, 22)
-    add_button(agents_tab, "Install", 400, 356, 90, 28, target, "installCodexHooks:")
-    add_button(agents_tab, "Uninstall", 500, 356, 100, 28, target, "uninstallCodexHooks:")
+    add_label(agents_tab, "Agent Hooks", 24, 432, 200, 24)
+    add_label(agents_tab, "Codex", 32, 394, 80, 22)
+    codex_status = add_label(agents_tab, "", 130, 394, 240, 22)
+    add_button(agents_tab, "Install", 400, 390, 90, 28, target, "installCodexHooks:")
+    add_button(agents_tab, "Uninstall", 500, 390, 100, 28, target, "uninstallCodexHooks:")
 
-    add_label(agents_tab, "Claude", 32, 326, 80, 22)
-    claude_status = add_label(agents_tab, "", 130, 326, 240, 22)
-    add_button(agents_tab, "Install", 400, 322, 90, 28, target, "installClaudeHooks:")
-    add_button(agents_tab, "Uninstall", 500, 322, 100, 28, target, "uninstallClaudeHooks:")
+    add_label(agents_tab, "Claude", 32, 360, 80, 22)
+    claude_status = add_label(agents_tab, "", 130, 360, 240, 22)
+    add_button(agents_tab, "Install", 400, 356, 90, 28, target, "installClaudeHooks:")
+    add_button(agents_tab, "Uninstall", 500, 356, 100, 28, target, "uninstallClaudeHooks:")
 
-    add_label(agents_tab, "Grok", 32, 292, 80, 22)
-    grok_status = add_label(agents_tab, "", 130, 292, 240, 22)
-    add_button(agents_tab, "Install", 400, 288, 90, 28, target, "installGrokHooks:")
-    add_button(agents_tab, "Uninstall", 500, 288, 100, 28, target, "uninstallGrokHooks:")
+    add_label(agents_tab, "Grok", 32, 326, 80, 22)
+    grok_status = add_label(agents_tab, "", 130, 326, 240, 22)
+    add_button(agents_tab, "Install", 400, 322, 90, 28, target, "installGrokHooks:")
+    add_button(agents_tab, "Uninstall", 500, 322, 100, 28, target, "uninstallGrokHooks:")
+
+    add_label(agents_tab, "Copilot", 32, 292, 80, 22)
+    copilot_status = add_label(agents_tab, "", 130, 292, 240, 22)
+    add_button(agents_tab, "Install", 400, 288, 90, 28, target, "installCopilotHooks:")
+    add_button(agents_tab, "Uninstall", 500, 288, 100, 28, target, "uninstallCopilotHooks:")
 
     add_separator(agents_tab, 24, 258, tab_width - 48)
     add_label(agents_tab, "Session Opening", 24, 224, 240, 24)
@@ -3410,6 +3436,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "codex_hook_status": codex_status,
         "claude_hook_status": claude_status,
         "grok_hook_status": grok_status,
+        "copilot_hook_status": copilot_status,
         "debug_log_status": debug_log_status,
         "codex_session_opener": codex_opener,
         "claude_session_opener": claude_opener,
@@ -3820,7 +3847,7 @@ def validate_lid_animation(animation: LedAnimationSetting) -> None:
 def program_for_lid_animation(
     animation: LedAnimationSetting,
     *,
-    brightness: int | float = 255,
+    brightness: int | float = DEFAULT_LED_BRIGHTNESS,
 ) -> str:
     validate_lid_animation(animation)
     return apply_brightness(normalize_led_text(animation.program), brightness)
@@ -4095,6 +4122,8 @@ def provider_icon_for_provider(provider: str):
     elif provider == "grok":
         image = app_icon("/Applications/Grok.app")
         image = image or grok_badge_icon()
+    elif provider == "copilot":
+        image = image_for_symbol("chevron.left.forwardslash.chevron.right", "GitHub Copilot")
     else:
         image = image_for_symbol("terminal", provider.title() or "Agent")
     _provider_icon_cache[provider] = image

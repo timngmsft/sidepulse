@@ -1,4 +1,4 @@
-"""Process entry point for Codex, Claude, and Grok hooks."""
+"""Process entry point for supported agent hooks."""
 
 from __future__ import annotations
 

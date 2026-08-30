@@ -61,8 +61,24 @@ GROK_EVENTS = (
     "SessionEnd",
 )
 
-HOOK_PROVIDERS = ("codex", "claude", "grok")
-KNOWN_EVENTS = tuple(dict.fromkeys(CODEX_EVENTS + CLAUDE_EVENTS + GROK_EVENTS))
+COPILOT_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "PreCompact",
+    "SubagentStop",
+    "Stop",
+    "SessionEnd",
+    "ErrorOccurred",
+)
+
+HOOK_PROVIDERS = ("codex", "claude", "grok", "copilot")
+KNOWN_EVENTS = tuple(
+    dict.fromkeys(CODEX_EVENTS + CLAUDE_EVENTS + GROK_EVENTS + COPILOT_EVENTS)
+)
 
 
 @dataclass(frozen=True)
@@ -101,7 +117,12 @@ def default_log_path(provider: str, home: Path | None = None) -> Path:
 
 
 def detect_provider_configs(home: Path | None = None) -> list[ProviderConfig]:
-    return [detect_codex_config(home), detect_claude_config(home), detect_grok_config(home)]
+    return [
+        detect_codex_config(home),
+        detect_claude_config(home),
+        detect_grok_config(home),
+        detect_copilot_config(home),
+    ]
 
 
 def detect_codex_config(home: Path | None = None) -> ProviderConfig:
@@ -243,6 +264,47 @@ def detect_grok_config(home: Path | None = None) -> ProviderConfig:
     )
 
 
+def default_copilot_hook_config_path(home: Path | None = None) -> Path:
+    if home is None:
+        copilot_home = os.environ.get("COPILOT_HOME")
+        if copilot_home:
+            return Path(copilot_home).expanduser() / "hooks" / "sidepulse.json"
+    base = home or Path.home()
+    return base / ".copilot" / "hooks" / "sidepulse.json"
+
+
+def detect_copilot_config(home: Path | None = None) -> ProviderConfig:
+    config_path = default_copilot_hook_config_path(home)
+    if not config_path.exists():
+        return ProviderConfig("copilot", config_path, False, False, (), ())
+
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception:
+        return ProviderConfig("copilot", config_path, True, False, (), ())
+
+    hooks = data.get("hooks") or {}
+    hook_events: list[str] = []
+    paths: list[Path] = []
+
+    if data.get("version") == 1 and isinstance(hooks, dict):
+        for event_name, entries in hooks.items():
+            canonical = canonical_event_name(event_name)
+            if canonical not in COPILOT_EVENTS or not isinstance(entries, list):
+                continue
+            hook_events.append(canonical)
+            paths.extend(_paths_from_hook_entries(entries))
+
+    return ProviderConfig(
+        "copilot",
+        config_path,
+        True,
+        bool(hook_events),
+        tuple(sorted(set(hook_events))),
+        _dedupe_paths(paths),
+    )
+
+
 def detect_log_path(provider: str, home: Path | None = None) -> Path:
     if provider == "codex":
         config = detect_codex_config(home)
@@ -250,6 +312,8 @@ def detect_log_path(provider: str, home: Path | None = None) -> Path:
         config = detect_claude_config(home)
     elif provider == "grok":
         config = detect_grok_config(home)
+    elif provider == "copilot":
+        config = detect_copilot_config(home)
     else:
         config = ProviderConfig(provider, default_log_path(provider, home), False, False, (), ())
     if config.log_paths:
@@ -388,12 +452,17 @@ def _paths_from_hook_entries(entries: list[Any]) -> list[Path]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        for key in ("bash", "command", "powershell"):
+            command = entry.get(key)
+            if isinstance(command, str):
+                paths.extend(extract_log_paths_from_command(command))
         for hook in entry.get("hooks") or []:
             if not isinstance(hook, dict):
                 continue
-            command = hook.get("command")
-            if isinstance(command, str):
-                paths.extend(extract_log_paths_from_command(command))
+            for key in ("bash", "command", "powershell"):
+                command = hook.get(key)
+                if isinstance(command, str):
+                    paths.extend(extract_log_paths_from_command(command))
     return paths
 
 

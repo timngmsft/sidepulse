@@ -20,7 +20,11 @@ The LED control DSL is described in [`LEDS_FORMAT.md`](LEDS_FORMAT.md).
 
 ### TLDR
 ```sh
-python3 -m pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install \
+  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ \
+  -e .
 sidepulse setup
 ```
 
@@ -86,8 +90,9 @@ SidePulse Pro and SidePulse Dot.
 
 #### AI Agent Monitoring
 
-SidePulse can monitor AI agents such as Codex, Claude, and Grok through hooks, then
-translate the current agent state into a small, glanceable LED status.
+SidePulse can monitor AI agents such as Codex, Claude, Grok, and GitHub Copilot
+CLI through hooks, then translate the current agent state into a small,
+glanceable LED status.
 
 Agent status modes:
 
@@ -147,6 +152,7 @@ The monitor currently supports:
 | Codex | `~/.codex/config.toml` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/codex.jsonl` |
 | Claude | `~/.claude/settings.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/claude.jsonl` |
 | Grok | `~/.grok/hooks/sidepulse.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/grok.jsonl` |
+| GitHub Copilot CLI | `${COPILOT_HOME:-~/.copilot}/hooks/sidepulse.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/copilot.jsonl` |
 
 #### Local reply classifier (Apple Silicon)
 
@@ -200,7 +206,11 @@ convention. Set `XDG_STATE_HOME` to place them somewhere else.
 Install locally for the `sidepulse` CLI:
 
 ```sh
-python3 -m pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install \
+  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ \
+  -e .
 ```
 
 For an isolated user installation that does not modify system Python packages:
@@ -212,7 +222,9 @@ For an isolated user installation that does not modify system Python packages:
 
 The installer creates `~/.local/share/sidepulse/venv` and links the CLI into
 `~/.local/bin`. Override `PYTHON_BIN`, `SIDEPULSE_INSTALL_ROOT`, or
-`SIDEPULSE_BIN_DIR` when a different location is needed.
+`SIDEPULSE_BIN_DIR` when a different location is needed. Package downloads use
+the Microsoft package feed proxy by default. Set `SIDEPULSE_PIP_INDEX_URL` to
+use a different PEP 503-compatible package index.
 
 This also installs the Cocoa dependencies for the macOS status-bar app.
 
@@ -222,11 +234,13 @@ Set up this Mac explicitly after package install:
 sidepulse setup
 ```
 
-`sidepulse setup` installs or refreshes Codex, Claude, and Grok hooks, installs
-SidePulse Pro Eject Prevention, writes the status-bar LaunchAgent, starts both helpers
-immediately, and enables them at login. This is intentionally an explicit
-command instead of a `pip install` side effect. To set up only one provider, use
-`sidepulse setup codex`, `sidepulse setup claude`, or `sidepulse setup grok`.
+`sidepulse setup` installs or refreshes Codex, Claude, Grok, and GitHub Copilot
+CLI hooks, installs SidePulse Pro Eject Prevention, writes the status-bar
+LaunchAgent, starts both helpers immediately, and enables them at login. This
+is intentionally an explicit command instead of a `pip install` side effect.
+To set up only one provider, use `sidepulse setup codex`,
+`sidepulse setup claude`, `sidepulse setup grok`, or
+`sidepulse setup copilot`.
 To skip the status-bar app but still install hooks and SidePulse Pro Eject Prevention, use
 `sidepulse setup --no-status-bar`.
 
@@ -283,11 +297,15 @@ sidepulse agent-monitor install
 sidepulse agent-monitor install codex
 sidepulse agent-monitor install claude
 sidepulse agent-monitor install grok
+sidepulse agent-monitor install copilot
 ```
 
 Each hook invokes a small, standard-library-only Python entry point. It writes
 the event to the monitor log and then makes a short best-effort local socket
 delivery to the status-bar app.
+
+GitHub Copilot CLI loads hook configuration when it starts. Restart any running
+Copilot CLI sessions after installing or removing its SidePulse hooks.
 
 Show current aggregated status:
 
@@ -384,6 +402,7 @@ sidepulse agent-monitor uninstall
 sidepulse agent-monitor uninstall codex
 sidepulse agent-monitor uninstall claude
 sidepulse agent-monitor uninstall grok
+sidepulse agent-monitor uninstall copilot
 ```
 
 Install and start the macOS status-bar app:
@@ -446,9 +465,9 @@ firmware/websim `sdled.wasm` engine, then AppKit only draws the returned RGB
 frames.
 
 Open `Settings...` from the dropdown to manage agent integrations. The settings
-window can install or uninstall Codex, Claude, and Grok hooks. The transcript
-checkboxes control the file-based CLI/debug fallback; the status-bar app gets
-live updates from the local hook event socket. Settings are stored at
+window can install or uninstall Codex, Claude, Grok, and GitHub Copilot CLI
+hooks. The transcript checkboxes control the file-based CLI/debug fallback; the
+status-bar app gets live updates from the local hook event socket. Settings are stored at
 `${XDG_CONFIG_HOME:-~/.config}/sidepulse/agent-monitor/settings.json`.
 
 Settings can export the hook decision log as CSV or HTML. This log lives at
@@ -569,7 +588,9 @@ python3 examples/audio_monitor.py --device /Volumes/SidePulsePro --gain-db 8 --r
 ## Tests
 
 ```sh
-python3 -m pip install -e '.[test]'
+python3 -m pip install \
+  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ \
+  -e '.[test]'
 python3 -m pytest tests -q
 ```
 

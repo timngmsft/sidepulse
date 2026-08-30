@@ -19,7 +19,12 @@ from AppKit import (
 from Foundation import NSObject, NSTimer
 from Quartz import CGContextFillRect, CGContextSetRGBFillColor
 
-from .led_status import LedDisplayState, normalize_brightness, program_for_display_state
+from .led_status import (
+    DEFAULT_LED_BRIGHTNESS,
+    LedDisplayState,
+    normalize_brightness,
+    program_for_display_state,
+)
 from .led_wasm import LedWasmUnavailableError, SdLedWasmController
 
 
@@ -121,7 +126,7 @@ def notch_bar_path(rect):
 def virtual_led_colors(
     state: LedDisplayState,
     elapsed: float,
-    brightness: int | float = 255,
+    brightness: int | float = DEFAULT_LED_BRIGHTNESS,
 ) -> list[tuple[float, float, float, float]]:
     """Return the eight LED colors for the same status animations as the device."""
     scale = normalize_brightness(brightness) / 255.0
@@ -228,7 +233,7 @@ class VirtualLedView(NSView):
         self = objc.super(VirtualLedView, self).initWithFrame_(frame)
         if self is not None:
             self.state = LedDisplayState.IDLE
-            self.brightness = 255
+            self.brightness = DEFAULT_LED_BRIGHTNESS
             self.started_at = time.monotonic()
             self.fixed_colors = None
             self.current_program = None
