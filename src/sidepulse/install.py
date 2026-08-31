@@ -195,7 +195,7 @@ def install_copilot_hooks(
         aliases.setdefault(canonical_event_name(key), []).append(key)
 
     for event_name in COPILOT_EVENTS:
-        cleaned: list[dict[str, Any]] = []
+        cleaned: list[Any] = []
         for key in aliases.get(event_name, []):
             entries = hooks.get(key)
             if not isinstance(entries, list):
@@ -820,11 +820,12 @@ def remove_json_command_hooks_for_log(entries: list[Any], log_path: Path) -> lis
 def remove_copilot_command_hooks_for_log(
     entries: list[Any],
     log_path: Path,
-) -> list[dict[str, Any]]:
+) -> list[Any]:
     target = str(log_path)
-    cleaned_entries: list[dict[str, Any]] = []
+    cleaned_entries: list[Any] = []
     for entry in entries:
         if not isinstance(entry, dict):
+            cleaned_entries.append(entry)
             continue
         commands = [
             entry.get(key, "")

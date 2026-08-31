@@ -4125,7 +4125,10 @@ def provider_icon_for_provider(provider: str):
         image = app_icon("/Applications/Grok.app")
         image = image or grok_badge_icon()
     elif provider == "copilot":
-        image = image_for_symbol("chevron.left.forwardslash.chevron.right", "GitHub Copilot")
+        image = app_icon("/Applications/GitHub Copilot.app")
+        image = image or image_for_symbol(
+            "chevron.left.forwardslash.chevron.right", "GitHub Copilot"
+        )
     else:
         image = image_for_symbol("terminal", provider.title() or "Agent")
     _provider_icon_cache[provider] = image

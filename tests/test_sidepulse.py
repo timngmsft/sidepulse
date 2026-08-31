@@ -56,6 +56,7 @@ from sidepulse.install import (
     install_codex_hooks,
     install_copilot_hooks,
     install_grok_hooks,
+    remove_copilot_command_hooks_for_log,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
     uninstall_copilot_hooks,
@@ -2992,6 +2993,28 @@ class AgentMonitorTests(unittest.TestCase):
                 data["hooks"]["PreToolUse"],
                 [{"type": "command", "bash": "echo keep >> /tmp/other.log"}],
             )
+
+    def test_copilot_hook_cleanup_preserves_unrecognized_entries(self) -> None:
+        log = Path("/tmp/copilot.jsonl")
+        entries = [
+            {"type": "command", "bash": "echo keep >> /tmp/other.log"},
+            "some-string-entry",
+            ["nested", "list"],
+            {"type": "command", "bash": f"jq -c . >> {log}"},
+        ]
+
+        cleaned = remove_copilot_command_hooks_for_log(entries, log)
+
+        # Only the entry targeting the SidePulse log is removed; entries this
+        # installer does not understand are left untouched rather than dropped.
+        self.assertEqual(
+            cleaned,
+            [
+                {"type": "command", "bash": "echo keep >> /tmp/other.log"},
+                "some-string-entry",
+                ["nested", "list"],
+            ],
+        )
 
     def test_grok_installer_removes_legacy_sidepulse_hook_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
