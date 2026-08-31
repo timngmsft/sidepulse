@@ -836,8 +836,10 @@ def install_hook_results(args: argparse.Namespace):
             results.append(install_claude_hooks(log_path=log_path, dry_run=args.dry_run))
         elif provider == "grok":
             results.append(install_grok_hooks(log_path=log_path, dry_run=args.dry_run))
-        else:
+        elif provider == "copilot":
             results.append(install_copilot_hooks(log_path=log_path, dry_run=args.dry_run))
+        else:
+            raise ValueError(f"Unknown hook provider: {provider}")
     return results
 
 
@@ -864,8 +866,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             results.append(uninstall_claude_hooks(log_path=log_path, dry_run=args.dry_run))
         elif provider == "grok":
             results.append(uninstall_grok_hooks(log_path=log_path, dry_run=args.dry_run))
-        else:
+        elif provider == "copilot":
             results.append(uninstall_copilot_hooks(log_path=log_path, dry_run=args.dry_run))
+        else:
+            raise ValueError(f"Unknown hook provider: {provider}")
 
     for result in results:
         action = "would remove" if args.dry_run and result.changed else "removed"

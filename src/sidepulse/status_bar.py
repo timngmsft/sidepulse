@@ -1186,10 +1186,12 @@ class StatusBarController(NSObject):
                 result = install_grok_hooks()
             elif provider == "grok":
                 result = uninstall_grok_hooks()
-            elif install:
+            elif provider == "copilot" and install:
                 result = install_copilot_hooks()
-            else:
+            elif provider == "copilot":
                 result = uninstall_copilot_hooks()
+            else:
+                raise ValueError(f"Unknown hook provider: {provider}")
         except Exception as exc:
             self.set_settings_message(f"{provider.title()} hooks failed: {exc}")
             self.refresh_settings_window()

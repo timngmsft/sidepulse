@@ -182,14 +182,28 @@ def install_copilot_hooks(
 
     original = json.dumps(data, sort_keys=True)
     data["version"] = 1
-    hooks = data.setdefault("hooks", {})
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    data["hooks"] = hooks
     command = hook_command("copilot", target_log, python_executable)
 
+    # Copilot CLI accepts both PascalCase and camelCase event names, so fold any
+    # existing aliases into the canonical key instead of adding a second one.
+    aliases: dict[str, list[str]] = {}
+    for key in list(hooks):
+        aliases.setdefault(canonical_event_name(key), []).append(key)
+
     for event_name in COPILOT_EVENTS:
-        entries = hooks.get(event_name, [])
-        if not isinstance(entries, list):
-            entries = []
-        cleaned = remove_copilot_command_hooks_for_log(entries, target_log)
+        cleaned: list[dict[str, Any]] = []
+        for key in aliases.get(event_name, []):
+            entries = hooks.get(key)
+            if not isinstance(entries, list):
+                if key == event_name:
+                    hooks.pop(key, None)
+                continue
+            hooks.pop(key, None)
+            cleaned.extend(remove_copilot_command_hooks_for_log(entries, target_log))
         cleaned.append(
             {
                 "type": "command",

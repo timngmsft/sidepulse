@@ -15,10 +15,11 @@ class UserInstallerTests(unittest.TestCase):
         self.assertIn('"$PYTHON_BIN" -m venv "$VENV_DIR"', text)
         self.assertIn('"$VENV_DIR/bin/python" -m pip install', text)
         self.assertIn(
-            "https://packagefeedproxy.microsoft.io/pypi/simple/", text
+            "PIP_INDEX_URL=${SIDEPULSE_PIP_INDEX_URL:-${PIP_INDEX_URL:-}}", text
         )
-        self.assertIn("SIDEPULSE_PIP_INDEX_URL", text)
-        self.assertIn('--index-url "$PIP_INDEX_URL"', text)
+        self.assertNotIn("packagefeedproxy.microsoft.io", text)
+        self.assertIn('set -- --index-url "$PIP_INDEX_URL"', text)
+        self.assertIn('-m pip install "$@" "$SOURCE_DIR"', text)
         self.assertNotIn("--break-system-packages", text)
 
     def test_installer_shell_syntax(self) -> None:

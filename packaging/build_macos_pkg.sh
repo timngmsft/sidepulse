@@ -16,7 +16,12 @@ APP_SIGN_IDENTITY="${APP_SIGN_IDENTITY:-}"
 INSTALLER_SIGN_IDENTITY="${INSTALLER_SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 ALLOW_UNSIGNED="${ALLOW_UNSIGNED:-0}"
-PIP_INDEX_URL="${SIDEPULSE_PIP_INDEX_URL:-${PIP_INDEX_URL:-https://packagefeedproxy.microsoft.io/pypi/simple/}}"
+PIP_INDEX_URL="${SIDEPULSE_PIP_INDEX_URL:-${PIP_INDEX_URL:-}}"
+# Fall back to the default PyPI index unless an alternate index is configured.
+PIP_INDEX_ARGS=()
+if [ -n "$PIP_INDEX_URL" ]; then
+    PIP_INDEX_ARGS=(--index-url "$PIP_INDEX_URL")
+fi
 
 if { [ -z "$APP_SIGN_IDENTITY" ] || [ -z "$INSTALLER_SIGN_IDENTITY" ]; } && [ "$ALLOW_UNSIGNED" != "1" ]; then
     echo "Set APP_SIGN_IDENTITY to a Developer ID Application identity and" >&2
@@ -27,8 +32,8 @@ fi
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
 python3 -m venv "$VENV_DIR"
-"$VENV_DIR/bin/python" -m pip install --index-url "$PIP_INDEX_URL" --upgrade pip
-"$VENV_DIR/bin/python" -m pip install --index-url "$PIP_INDEX_URL" 'pyinstaller>=6.10' "$ROOT_DIR"
+"$VENV_DIR/bin/python" -m pip install ${PIP_INDEX_ARGS+"${PIP_INDEX_ARGS[@]}"} --upgrade pip
+"$VENV_DIR/bin/python" -m pip install ${PIP_INDEX_ARGS+"${PIP_INDEX_ARGS[@]}"} 'pyinstaller>=6.10' "$ROOT_DIR"
 
 "$VENV_DIR/bin/pyinstaller" \
     --noconfirm --clean --windowed \

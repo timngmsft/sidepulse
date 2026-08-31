@@ -22,9 +22,7 @@ The LED control DSL is described in [`LEDS_FORMAT.md`](LEDS_FORMAT.md).
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install \
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ \
-  -e .
+python -m pip install -e .
 sidepulse setup
 ```
 
@@ -208,9 +206,7 @@ Install locally for the `sidepulse` CLI:
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install \
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ \
-  -e .
+python -m pip install -e .
 ```
 
 For an isolated user installation that does not modify system Python packages:
@@ -223,8 +219,8 @@ For an isolated user installation that does not modify system Python packages:
 The installer creates `~/.local/share/sidepulse/venv` and links the CLI into
 `~/.local/bin`. Override `PYTHON_BIN`, `SIDEPULSE_INSTALL_ROOT`, or
 `SIDEPULSE_BIN_DIR` when a different location is needed. Package downloads use
-the Microsoft package feed proxy by default. Set `SIDEPULSE_PIP_INDEX_URL` to
-use a different PEP 503-compatible package index.
+PyPI by default. Set `SIDEPULSE_PIP_INDEX_URL` to install from a different
+PEP 503-compatible package index, such as an internal mirror or proxy.
 
 This also installs the Cocoa dependencies for the macOS status-bar app.
 
@@ -588,9 +584,7 @@ python3 examples/audio_monitor.py --device /Volumes/SidePulsePro --gain-db 8 --r
 ## Tests
 
 ```sh
-python3 -m pip install \
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ \
-  -e '.[test]'
+python3 -m pip install -e '.[test]'
 python3 -m pytest tests -q
 ```
 

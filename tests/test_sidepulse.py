@@ -2942,6 +2942,57 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertNotIn("SubagentStart", data["hooks"])
             self.assertTrue(all(entry["timeoutSec"] == 5 for entry in data["hooks"]["Stop"]))
 
+    def test_copilot_installer_folds_camel_case_event_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "hooks" / "sidepulse.json"
+            log = base / "copilot.jsonl"
+            config.parent.mkdir()
+            config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "hooks": {
+                            "preToolUse": [
+                                {
+                                    "type": "command",
+                                    "bash": "echo keep >> /tmp/other.log",
+                                },
+                                {
+                                    "type": "command",
+                                    "bash": f"jq -c . >> {log}",
+                                },
+                            ]
+                        },
+                    }
+                )
+            )
+
+            install_copilot_hooks(
+                log_path=log,
+                config_path=config,
+                python_executable="python3",
+            )
+
+            data = json.loads(config.read_text())
+            # Copilot CLI accepts both casings, so leaving the alias behind would
+            # fire the hook twice for every PreToolUse event.
+            self.assertNotIn("preToolUse", data["hooks"])
+            commands = [entry["bash"] for entry in data["hooks"]["PreToolUse"]]
+            self.assertEqual(len(commands), 2)
+            self.assertIn("echo keep >> /tmp/other.log", commands)
+            self.assertEqual(
+                sum("--provider copilot" in command for command in commands), 1
+            )
+
+            uninstall_copilot_hooks(log_path=log, config_path=config)
+
+            data = json.loads(config.read_text())
+            self.assertEqual(
+                data["hooks"]["PreToolUse"],
+                [{"type": "command", "bash": "echo keep >> /tmp/other.log"}],
+            )
+
     def test_grok_installer_removes_legacy_sidepulse_hook_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -3682,17 +3733,13 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(
             program_for_display_state(LedDisplayState.IDLE),
-            "brightness 204\noff\n#020204 6s pulse\nrepeat",
+            "off\n#020204 6s pulse\nrepeat",
         )
-        self.assertEqual(
-            program_for_display_state(LedDisplayState.DONE),
-            "brightness 204\n#00FF66",
-        )
+        self.assertEqual(program_for_display_state(LedDisplayState.DONE), "#00FF66")
         self.assertIn("#FF3A00 1.6s pulse", program_for_display_state(LedDisplayState.ASK))
         self.assertEqual(
             program_for_display_state(LedDisplayState.WORKING, led_count=2).splitlines(),
             [
-                "brightness 204",
                 "off 160ms cosine",
                 "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms",
                 "repeat",
@@ -3700,7 +3747,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
         self.assertEqual(
             len(program_for_display_state(LedDisplayState.WORKING, led_count=8).splitlines()),
-            4,
+            3,
         )
         self.assertEqual(
             program_for_display_state(LedDisplayState.DONE, brightness=128),
@@ -3719,7 +3766,6 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(result.target, device / "LEDS.LED")
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
-                "brightness 204\n"
                 "off 160ms cosine\n"
                 "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms\n"
                 "repeat",
@@ -3729,7 +3775,7 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
-                "brightness 204\noff\n#020204 6s pulse\nrepeat",
+                "off\n#020204 6s pulse\nrepeat",
             )
 
             write_mode_to_leds(AgentMode.COMPLETED, device_path=device, brightness=64)
@@ -3748,12 +3794,11 @@ class AgentMonitorTests(unittest.TestCase):
             write_mode_to_leds(AgentMode.WORKING, device_path=device)
 
             lines = (device / "LEDS.LED").read_text().splitlines()
-            self.assertEqual(len(lines), 4)
-            self.assertEqual(lines[0], "brightness 204")
-            self.assertEqual(lines[1], "off 160ms cosine")
-            self.assertIn("0:#00E5FF 760ms pulse 0ms", lines[2])
-            self.assertIn("5:#00E5FF 760ms pulse 475ms", lines[2])
-            self.assertIn("7:#00E5FF 760ms pulse 665ms", lines[2])
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(lines[0], "off 160ms cosine")
+            self.assertIn("0:#00E5FF 760ms pulse 0ms", lines[1])
+            self.assertIn("5:#00E5FF 760ms pulse 475ms", lines[1])
+            self.assertIn("7:#00E5FF 760ms pulse 665ms", lines[1])
             self.assertEqual(lines[-1], "repeat")
 
     def test_agent_led_controller_skips_unchanged_state(self) -> None:
@@ -3821,12 +3866,11 @@ class AgentMonitorTests(unittest.TestCase):
 
         validate_led_text(program)
         lines = program.splitlines()
-        self.assertEqual(lines[0], "brightness 204")
-        self.assertIn(f"0:{BATTERY_CHARGING_MINT} 360ms ease", lines[1])
-        self.assertIn(f"3:{BATTERY_CHARGING_MINT} 360ms ease", lines[1])
-        self.assertIn("4:#000000 360ms ease", lines[1])
-        self.assertEqual(lines[2], f"4:{BATTERY_CHARGING_MINT} 790ms pulse")
-        self.assertEqual(len(lines), 3)
+        self.assertIn(f"0:{BATTERY_CHARGING_MINT} 360ms ease", lines[0])
+        self.assertIn(f"3:{BATTERY_CHARGING_MINT} 360ms ease", lines[0])
+        self.assertIn("4:#000000 360ms ease", lines[0])
+        self.assertEqual(lines[1], f"4:{BATTERY_CHARGING_MINT} 790ms pulse")
+        self.assertEqual(len(lines), 2)
         self.assertNotIn("repeat", program)
         self.assertNotIn("\noff", program)
 
@@ -3836,7 +3880,7 @@ class AgentMonitorTests(unittest.TestCase):
         program = program_for_battery(snapshot, led_count=8)
 
         validate_led_text(program)
-        self.assertEqual(len(program.splitlines()), 2)
+        self.assertEqual(len(program.splitlines()), 1)
         self.assertIn("0:#FFB000 360ms ease", program)
         self.assertIn("3:#FFB000 360ms ease", program)
         self.assertIn("4:#000000 360ms ease", program)
@@ -3848,7 +3892,7 @@ class AgentMonitorTests(unittest.TestCase):
         program = program_for_battery(snapshot, led_count=8)
 
         validate_led_text(program)
-        segments = program.splitlines()[-1].split(";")
+        segments = program.split(";")
         self.assertEqual(segments[0], "0:#00FF66 360ms ease")
         self.assertEqual(segments[3], "3:#00FF66 360ms ease")
         self.assertEqual(segments[4], "4:#008F39 360ms ease")
@@ -4720,7 +4764,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         self.assertEqual(remembered.display_for_device("/Volumes/SidePulseDot"), "battery")
-        self.assertEqual(remembered.brightness_for_device("/Volumes/SidePulseDot"), 204)
+        self.assertEqual(remembered.brightness_for_device("/Volumes/SidePulseDot"), 255)
 
     def test_settings_remove_remembered_device(self) -> None:
         settings = AgentMonitorSettings(
