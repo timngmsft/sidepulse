@@ -485,6 +485,7 @@ def default_sources(settings: AgentMonitorSettings | None = None) -> tuple[Sourc
     if active_settings.claude_transcripts_enabled:
         sources.append(SourceSpec(CLAUDE_TRANSCRIPT_PROVIDER, Path.home() / ".claude" / "projects"))
     sources.append(SourceSpec("grok", detect_log_path("grok")))
+    sources.append(SourceSpec("copilot", detect_log_path("copilot")))
     return unique_sources(sources)
 
 
@@ -1035,6 +1036,8 @@ def mode_for_event(record: HookEvent) -> AgentMode | None:
     if explicit_mode is not None:
         return explicit_mode
 
+    if event == "ErrorOccurred":
+        return AgentMode.WORKING if raw.get("recoverable") is True else AgentMode.BLOCKED_ERROR
     if event in {"PostToolUseFailure", "PermissionDenied", "StopFailure"}:
         return AgentMode.BLOCKED_ERROR
     if event in {"PermissionRequest"}:

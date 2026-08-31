@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .battery import DEFAULT_POWER_CHANGE_PREVIEW_SECONDS
+from .led_status import DEFAULT_LED_BRIGHTNESS
 from .session_actions import SESSION_OPEN_CHOICES, SESSION_OPEN_TERMINAL
 
 
@@ -119,7 +120,7 @@ class DeviceDisplaySetting:
     name: str
     path: str
     led_display: str = LED_DISPLAY_AGENT
-    brightness: int = 255
+    brightness: int = DEFAULT_LED_BRIGHTNESS
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -188,7 +189,7 @@ class AgentMonitorSettings:
         for device in self.devices:
             if device.device_id == device_id:
                 return normalize_brightness(device.brightness)
-        return 255
+        return DEFAULT_LED_BRIGHTNESS
 
     def with_device_display(
         self,
@@ -793,10 +794,10 @@ def normalize_history_timeframe(value: object) -> float:
 
 def normalize_brightness(value: object) -> int:
     if value is None:
-        return 255
+        return DEFAULT_LED_BRIGHTNESS
     if isinstance(value, (int, float)):
         return max(0, min(255, int(round(float(value)))))
-    return 255
+    return DEFAULT_LED_BRIGHTNESS
 
 
 def default_lid_animation(kind: str) -> LedAnimationSetting:

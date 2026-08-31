@@ -17,8 +17,12 @@ from .device_writer import (
     resolve_target_path,
     write_led_program,
 )
-from .led_status import led_count_for_target
-from .led_status import apply_brightness, normalize_brightness
+from .led_status import (
+    DEFAULT_LED_BRIGHTNESS,
+    apply_brightness,
+    led_count_for_target,
+    normalize_brightness,
+)
 
 
 BATTERY_LOW_RED = "#FF2600"
@@ -287,7 +291,7 @@ def program_for_battery(
     led_count: int = 8,
     full_charge_watts: float | None = None,
     transition_ms: int = 360,
-    brightness: int | float = 255,
+    brightness: int | float = DEFAULT_LED_BRIGHTNESS,
 ) -> str:
     count = max(1, min(8, int(led_count)))
     percent = max(0, min(100, int(snapshot.percent)))
@@ -382,7 +386,7 @@ def write_battery_to_leds(
     file_name: str = DEFAULT_FILE_NAME,
     dry_run: bool = False,
     full_charge_watts: float | None = None,
-    brightness: int | float = 255,
+    brightness: int | float = DEFAULT_LED_BRIGHTNESS,
 ) -> BatteryLedWrite:
     target = resolve_target_path(device_path=device_path, file_name=file_name)
     program = program_for_battery(
@@ -412,7 +416,7 @@ class BatteryLedController:
         file_name: str = DEFAULT_FILE_NAME,
         dry_run: bool = False,
         error_retry_seconds: float = 10.0,
-        brightness: int | float = 255,
+        brightness: int | float = DEFAULT_LED_BRIGHTNESS,
     ) -> None:
         self.device_path = device_path
         self.file_name = file_name

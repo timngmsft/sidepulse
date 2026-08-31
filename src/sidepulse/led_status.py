@@ -33,6 +33,7 @@ ASK_AMBER = "#FF3A00"
 WORKING_CYAN = "#00E5FF"
 DONE_GREEN = "#00FF66"
 IDLE_DIM = "#020204"
+DEFAULT_LED_BRIGHTNESS = 255
 DEVICE_LED_COUNTS = {
     "sidepulsedot": 2,
     "sidepulsepro": 8,
@@ -70,7 +71,7 @@ def program_for_display_state(
     state: LedDisplayState,
     *,
     led_count: int = 8,
-    brightness: int | float = 255,
+    brightness: int | float = DEFAULT_LED_BRIGHTNESS,
 ) -> str:
     if state == LedDisplayState.IDLE:
         return apply_brightness(
@@ -124,7 +125,7 @@ def write_mode_to_leds(
     device_path: Path | None = None,
     file_name: str = DEFAULT_FILE_NAME,
     dry_run: bool = False,
-    brightness: int | float = 255,
+    brightness: int | float = DEFAULT_LED_BRIGHTNESS,
 ) -> LedStatusWrite:
     target = resolve_target_path(device_path=device_path, file_name=file_name)
     state = display_state_for_mode(mode)
@@ -184,7 +185,7 @@ class AgentLedController:
         file_name: str = DEFAULT_FILE_NAME,
         dry_run: bool = False,
         error_retry_seconds: float = 10.0,
-        brightness: int | float = 255,
+        brightness: int | float = DEFAULT_LED_BRIGHTNESS,
     ) -> None:
         self.device_path = device_path
         self.file_name = file_name

@@ -94,6 +94,8 @@ def origin_from_environment(provider: str, env: Mapping[str, str]) -> AgentOrigi
             return surface_origin(provider, "app", "env:__CFBundleIdentifier")
         if provider == "grok" and "grok" in bundle_id:
             return surface_origin(provider, "app", "env:__CFBundleIdentifier")
+        if provider == "copilot" and "github" in bundle_id and "copilot" in bundle_id:
+            return surface_origin(provider, "app", "env:__CFBundleIdentifier")
 
     return None
 
@@ -128,6 +130,8 @@ def origin_from_processes(
             return surface_origin(provider, "cli", "process:claude")
         if provider == "grok" and basename == "grok":
             return surface_origin(provider, "cli", "process:grok")
+        if provider == "copilot" and basename == "copilot":
+            return surface_origin(provider, "cli", "process:copilot")
 
     return None
 
@@ -152,6 +156,12 @@ def surface_origin(provider: str, surface: str, source: str) -> AgentOrigin:
         ("grok", "cursor"): "Grok in Cursor",
         ("grok", "windsurf"): "Grok in Windsurf",
         ("grok", "transcript"): "Grok Transcript",
+        ("copilot", "app"): "GitHub Copilot",
+        ("copilot", "cli"): "GitHub Copilot CLI",
+        ("copilot", "vscode"): "GitHub Copilot in VS Code",
+        ("copilot", "cursor"): "GitHub Copilot in Cursor",
+        ("copilot", "windsurf"): "GitHub Copilot in Windsurf",
+        ("copilot", "transcript"): "GitHub Copilot Transcript",
     }
     label = labels.get((provider, surface), provider_label(provider))
     return AgentOrigin(

@@ -18,7 +18,10 @@ from typing import Any
 from .providers import (
     CLAUDE_EVENTS,
     CODEX_EVENTS,
+    COPILOT_EVENTS,
     GROK_EVENTS,
+    canonical_event_name,
+    default_copilot_hook_config_path,
     default_grok_hook_config_path,
     detect_log_path,
 )
@@ -167,6 +170,61 @@ def install_grok_hooks(
     return InstallResult("grok", config, target_log, changed, backup, dry_run)
 
 
+def install_copilot_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+    python_executable: str | None = None,
+) -> InstallResult:
+    config = config_path or default_copilot_hook_config_path()
+    target_log = (log_path or detect_log_path("copilot")).expanduser()
+    data = read_json_config(config)
+
+    original = json.dumps(data, sort_keys=True)
+    data["version"] = 1
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    data["hooks"] = hooks
+    command = hook_command("copilot", target_log, python_executable)
+
+    # Copilot CLI accepts both PascalCase and camelCase event names, so fold any
+    # existing aliases into the canonical key instead of adding a second one.
+    aliases: dict[str, list[str]] = {}
+    for key in list(hooks):
+        aliases.setdefault(canonical_event_name(key), []).append(key)
+
+    for event_name in COPILOT_EVENTS:
+        cleaned: list[Any] = []
+        for key in aliases.get(event_name, []):
+            entries = hooks.get(key)
+            if not isinstance(entries, list):
+                if key == event_name:
+                    hooks.pop(key, None)
+                continue
+            hooks.pop(key, None)
+            cleaned.extend(remove_copilot_command_hooks_for_log(entries, target_log))
+        cleaned.append(
+            {
+                "type": "command",
+                "bash": command,
+                "timeoutSec": 5,
+            }
+        )
+        hooks[event_name] = cleaned
+
+    changed = json.dumps(data, sort_keys=True) != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config)
+        config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        target_log.parent.mkdir(parents=True, exist_ok=True)
+        target_log.touch(exist_ok=True)
+
+    return InstallResult("copilot", config, target_log, changed, backup, dry_run)
+
+
 def uninstall_codex_hooks(
     log_path: Path | None = None,
     config_path: Path | None = None,
@@ -278,6 +336,50 @@ def uninstall_grok_hooks(
         clean_grok_live_backup_hook_files(config)
 
     return InstallResult("grok", config, target_log, changed, backup, dry_run)
+
+
+def uninstall_copilot_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+) -> InstallResult:
+    config = config_path or default_copilot_hook_config_path()
+    target_log = (log_path or detect_log_path("copilot")).expanduser()
+    data = read_json_config(config)
+
+    original = json.dumps(data, sort_keys=True)
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for event_name in list(hooks):
+            entries = hooks.get(event_name)
+            if canonical_event_name(event_name) not in COPILOT_EVENTS or not isinstance(entries, list):
+                continue
+            cleaned = remove_copilot_command_hooks_for_log(entries, target_log)
+            if cleaned:
+                hooks[event_name] = cleaned
+            else:
+                hooks.pop(event_name, None)
+
+        if not hooks:
+            data.pop("hooks", None)
+
+    if set(data) == {"version"}:
+        data = {}
+
+    changed = json.dumps(data, sort_keys=True) != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config)
+        if data:
+            config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        else:
+            try:
+                config.unlink()
+            except FileNotFoundError:
+                pass
+
+    return InstallResult("copilot", config, target_log, changed, backup, dry_run)
 
 
 def hook_command(
@@ -712,6 +814,32 @@ def remove_json_command_hooks_for_log(entries: list[Any], log_path: Path) -> lis
             kept = dict(entry)
             kept["hooks"] = cleaned_hooks
             cleaned_entries.append(kept)
+    return cleaned_entries
+
+
+def remove_copilot_command_hooks_for_log(
+    entries: list[Any],
+    log_path: Path,
+) -> list[Any]:
+    target = str(log_path)
+    cleaned_entries: list[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            cleaned_entries.append(entry)
+            continue
+        commands = [
+            entry.get(key, "")
+            for key in ("bash", "command", "powershell")
+            if isinstance(entry.get(key), str)
+        ]
+        if any(
+            target in command
+            or "sidepulse hook-log" in command
+            or "hook_entry.py" in command
+            for command in commands
+        ):
+            continue
+        cleaned_entries.append(dict(entry))
     return cleaned_entries
 
 
