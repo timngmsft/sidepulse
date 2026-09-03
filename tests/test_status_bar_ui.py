@@ -19,8 +19,13 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shlex
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -56,6 +61,7 @@ def tearDownModule():
 
 from AppKit import (  # noqa: E402
     NSApplication,
+    NSBitmapImageRep,
     NSControl,
     NSImage,
     NSMenu,
@@ -67,6 +73,14 @@ from sidepulse import status_bar as sb  # noqa: E402
 from sidepulse import virtual_device as vd  # noqa: E402
 from sidepulse.collector import MonitorSnapshot, SourceSpec  # noqa: E402
 from sidepulse.models import AgentMode, AgentStatus, AggregateStatus  # noqa: E402
+from sidepulse.models import SOURCE_KIND_HERDR_REMOTE  # noqa: E402
+from sidepulse.remote_herdr import (  # noqa: E402
+    HerdrConnectionState,
+    HerdrConnectionStatus,
+    HerdrRemoteTestResult,
+    HerdrTransportError,
+)
+from sidepulse.settings import AgentMonitorSettings, HerdrRemoteSetting  # noqa: E402
 
 
 # A selector literal: camelCase identifier ending in a single colon.
@@ -225,11 +239,337 @@ class SelectorWiringTests(StatusBarTestCase):
             self.assertIn(expected, found)
 
     def test_controller_implements_application_delegate_hook(self):
-        self.assertTrue(
-            sb.StatusBarController.instancesRespondToSelector_(
-                "applicationDidFinishLaunching:"
+        for selector in (
+            "applicationDidFinishLaunching:",
+            "applicationShouldTerminate:",
+            "applicationWillTerminate:",
+        ):
+            with self.subTest(selector=selector):
+                self.assertTrue(
+                    sb.StatusBarController.instancesRespondToSelector_(selector)
+                )
+
+
+class ApplicationLifecycleTests(StatusBarTestCase):
+    def test_termination_defers_cleanup_and_carries_unsaved_operations(self):
+        controller = sb.StatusBarController.alloc().init()
+        remote = HerdrRemoteSetting("draft-1", "Draft", "workbox")
+        control_path = Path("/tmp/sidepulse-draft-control")
+        cancel_event = threading.Event()
+        controller.remote_test_in_flight = True
+        controller.remote_test_cancel_event = cancel_event
+        controller.remote_test_setting = remote
+        controller.remote_test_control_path = control_path
+
+        with patch.object(sb.threading, "Thread") as thread_type:
+            result = controller.applicationShouldTerminate_(None)
+
+            self.assertEqual(result, sb.NSTerminateLater)
+            self.assertTrue(cancel_event.is_set())
+            self.assertEqual(
+                thread_type.call_args.kwargs["args"],
+                ((remote, control_path), (), ()),
             )
+            thread_type.return_value.start.assert_called_once_with()
+            self.assertEqual(
+                controller.applicationShouldTerminate_(None),
+                sb.NSTerminateLater,
+            )
+            thread_type.assert_called_once()
+
+        controller.termination_cleanup_finished = True
+        self.assertEqual(
+            controller.applicationShouldTerminate_(None),
+            sb.NSTerminateNow,
         )
+
+    def test_cleanup_failure_still_replies_to_appkit(self):
+        events = []
+
+        class BrokenManager:
+            def stop(self, **_kwargs):
+                events.append("stop")
+                raise RuntimeError("cleanup failed")
+
+        class TestThread:
+            def join(self):
+                events.append("join")
+
+        class Harness:
+            remote_manager = BrokenManager()
+
+            def __init__(self):
+                self.scheduled = []
+
+            def performSelectorOnMainThread_withObject_waitUntilDone_(
+                self,
+                selector,
+                payload,
+                wait,
+            ):
+                self.scheduled.append((selector, payload, wait))
+
+        harness = Harness()
+
+        with patch.object(sb, "log_status_bar") as log_status:
+            sb.StatusBarController.finish_application_cleanup(
+                harness,
+                None,
+                (),
+                (TestThread(),),
+            )
+
+        self.assertEqual(events, ["join", "stop"])
+        log_status.assert_called_once_with(
+            "remote shutdown cleanup failed (RuntimeError)"
+        )
+        self.assertEqual(
+            harness.scheduled,
+            [("completeApplicationTermination:", None, False)],
+        )
+
+    def test_late_authentication_completion_is_ignored_after_cancel(self):
+        class RemoteManager:
+            def __init__(self):
+                self.closed = []
+                self.adopted = []
+
+            def close_control_master(
+                self,
+                remote,
+                *,
+                control_path=None,
+                wait=False,
+            ):
+                self.closed.append((remote, control_path, wait))
+
+            def adopt_control_path(self, remote, control_path):
+                self.adopted.append((remote, control_path))
+                return None
+
+        controller = sb.StatusBarController.alloc().init()
+        manager = RemoteManager()
+        controller.remote_manager = manager
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            attempt = sb.HerdrAuthenticationAttempt(
+                remote=remote,
+                token="token",
+                marker=root / "complete",
+                acknowledgement=root / "ack",
+                cancellation=root / "cancel",
+                control_path=root / "control",
+            )
+            controller.remote_auth_attempts[remote.remote_id] = attempt
+
+            controller.cancel_herdr_authentication(remote.remote_id)
+            controller.resumeHerdrRemoteAfterAuth_(
+                {"remote_id": remote.remote_id, "token": attempt.token}
+            )
+
+            self.assertTrue(attempt.cancellation.exists())
+            self.assertEqual(
+                manager.closed,
+                [(remote, attempt.control_path, False)],
+            )
+            self.assertEqual(manager.adopted, [])
+
+    def test_authentication_ack_failure_restores_previous_control_path(self):
+        class RemoteManager:
+            def __init__(self, current):
+                self.current = current
+                self.adopted = []
+                self.closed = []
+                self.retried = []
+
+            def adopt_control_path(self, remote, control_path):
+                previous = (
+                    self.current
+                    if self.current is not None and self.current != control_path
+                    else None
+                )
+                self.current = control_path
+                self.adopted.append((remote, control_path))
+                return previous
+
+            def close_control_master(
+                self,
+                remote,
+                *,
+                control_path=None,
+                wait=False,
+            ):
+                self.closed.append((remote, control_path, wait))
+
+            def retry(self, remote_id):
+                self.retried.append(remote_id)
+
+        controller = sb.StatusBarController.alloc().init()
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+        controller.settings = AgentMonitorSettings(herdr_remotes=(remote,))
+        controller.remote_manager_started = True
+        previous_control_path = Path("/tmp/sidepulse-previous-control")
+        manager = RemoteManager(previous_control_path)
+        controller.remote_manager = manager
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing"
+            attempt = sb.HerdrAuthenticationAttempt(
+                remote=remote,
+                token="token",
+                marker=missing / "complete",
+                acknowledgement=missing / "ack",
+                cancellation=missing / "cancel",
+                control_path=Path(tmp) / "new-control",
+            )
+            controller.remote_auth_attempts[remote.remote_id] = attempt
+
+            controller.resumeHerdrRemoteAfterAuth_(
+                {"remote_id": remote.remote_id, "token": attempt.token}
+            )
+
+        self.assertEqual(manager.current, previous_control_path)
+        self.assertEqual(
+            manager.adopted,
+            [
+                (remote, attempt.control_path),
+                (remote, previous_control_path),
+            ],
+        )
+        self.assertEqual(
+            manager.closed,
+            [(remote, attempt.control_path, False)],
+        )
+        self.assertEqual(manager.retried, [])
+        self.assertNotIn(remote.remote_id, controller.remote_auth_attempts)
+
+    def test_remote_actions_surface_control_path_preparation_errors(self):
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+
+        class TestHarness:
+            remote_test_status = ""
+
+            def __init__(self):
+                self.refreshed = False
+
+            def herdr_remote_from_fields(self):
+                return remote
+
+            def start_herdr_remote_test(self, _remote):
+                raise HerdrTransportError("control directory unavailable")
+
+            def refresh_remote_connection_labels(self):
+                self.refreshed = True
+
+        test_harness = TestHarness()
+        sb.StatusBarController.__dict__["testHerdrRemote_"].callable(
+            test_harness,
+            None,
+        )
+
+        self.assertEqual(
+            test_harness.remote_test_status,
+            "Test failed: control directory unavailable",
+        )
+        self.assertTrue(test_harness.refreshed)
+
+        class AuthenticationHarness:
+            settings = AgentMonitorSettings()
+            remote_test_status = ""
+
+            def __init__(self):
+                self.refreshed = False
+
+            def herdr_remote_from_fields(self):
+                return remote
+
+            def cancel_herdr_authentication(self, _remote_id):
+                return None
+
+            def refresh_remote_connection_labels(self):
+                self.refreshed = True
+
+        authentication_harness = AuthenticationHarness()
+        with patch.object(
+            sb,
+            "herdr_ssh_control_path",
+            side_effect=HerdrTransportError("control directory unavailable"),
+        ):
+            sb.StatusBarController.__dict__["authenticateHerdrRemote_"].callable(
+                authentication_harness,
+                None,
+            )
+
+        self.assertEqual(
+            authentication_harness.remote_test_status,
+            "Could not prepare authentication: control directory unavailable",
+        )
+        self.assertTrue(authentication_harness.refreshed)
+
+    def test_failed_remote_writes_do_not_mutate_controller_settings(self):
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+
+        class SaveHarness:
+            def __init__(self):
+                self.settings = AgentMonitorSettings()
+                self.remote_test_status = ""
+                self.refreshed = False
+
+            def herdr_remote_from_fields(self):
+                return remote
+
+            def refresh_remote_connection_labels(self):
+                self.refreshed = True
+
+        save_harness = SaveHarness()
+        original_save_settings = save_harness.settings
+        with patch.object(
+            sb,
+            "save_settings",
+            side_effect=OSError("read-only settings"),
+        ):
+            sb.StatusBarController.__dict__["saveHerdrRemote_"].callable(
+                save_harness,
+                None,
+            )
+
+        self.assertIs(save_harness.settings, original_save_settings)
+        self.assertEqual(
+            save_harness.remote_test_status,
+            "Could not save remote: read-only settings",
+        )
+        self.assertTrue(save_harness.refreshed)
+
+        class RemoveHarness:
+            def __init__(self):
+                self.settings = AgentMonitorSettings(herdr_remotes=(remote,))
+                self.remote_test_status = ""
+                self.refreshed = False
+
+            def selected_herdr_remote(self):
+                return remote
+
+            def refresh_remote_connection_labels(self):
+                self.refreshed = True
+
+        remove_harness = RemoveHarness()
+        original_remove_settings = remove_harness.settings
+        with patch.object(
+            sb,
+            "save_settings",
+            side_effect=OSError("read-only settings"),
+        ):
+            sb.StatusBarController.__dict__["removeHerdrRemote_"].callable(
+                remove_harness,
+                None,
+            )
+
+        self.assertIs(remove_harness.settings, original_remove_settings)
+        self.assertEqual(
+            remove_harness.remote_test_status,
+            "Could not remove remote: read-only settings",
+        )
+        self.assertTrue(remove_harness.refreshed)
 
 
 class MenuBuildTests(StatusBarTestCase):
@@ -331,6 +671,95 @@ class MenuBuildTests(StatusBarTestCase):
         )
         self.assertLessEqual(len(sb.recent_statuses(snapshot)), 12)
 
+    def test_remote_agents_are_grouped_and_not_actionable_locally(self):
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+        status = make_status(
+            provider="copilot",
+            agent_id="herdr:remote-1:term-1:copilot",
+            display_name="Remote task",
+            origin="Workbox via Herdr",
+        )
+        status = AgentStatus(
+            **{
+                **status.__dict__,
+                "source_kind": SOURCE_KIND_HERDR_REMOTE,
+                "source_id": "remote-1",
+            }
+        )
+        original_settings = self.controller.settings
+        original_manager = self.controller.remote_manager
+        self.controller.settings = AgentMonitorSettings(herdr_remotes=(remote,))
+        self.controller.remote_manager = type(
+            "RemoteManager",
+            (),
+            {
+                "connection_status": lambda _self, _remote_id: HerdrConnectionStatus(
+                    "remote-1",
+                    HerdrConnectionState.CONNECTED,
+                )
+            },
+        )()
+        self.addCleanup(setattr, self.controller, "settings", original_settings)
+        self.addCleanup(setattr, self.controller, "remote_manager", original_manager)
+
+        menu = sb.build_menu(
+            make_snapshot(statuses=[status]),
+            sb.STATE_WORKING,
+            self.controller,
+        )
+        titles = [item.title() for item in walk_menu(menu)]
+        remote_item = next(
+            item for item in walk_menu(menu) if item.title().startswith("Remote task")
+        )
+
+        self.assertIn("Local", titles)
+        self.assertIn("Workbox via Herdr", titles)
+        self.assertIn("Connected", titles)
+        self.assertFalse(remote_item.isEnabled())
+        self.assertIsNone(remote_item.action())
+
+    def test_local_history_cap_does_not_hide_remote_agents(self):
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+        local_statuses = [
+            make_status(agent_id=f"local-{index}", age_seconds=float(index))
+            for index in range(20)
+        ]
+        remote_status = replace(
+            make_status(
+                provider="copilot",
+                agent_id="herdr:remote-1:term-1:copilot",
+                display_name="Older remote task",
+                age_seconds=100,
+                origin="Workbox via Herdr",
+            ),
+            source_kind=SOURCE_KIND_HERDR_REMOTE,
+            source_id="remote-1",
+        )
+        original_settings = self.controller.settings
+        original_manager = self.controller.remote_manager
+        self.controller.settings = AgentMonitorSettings(herdr_remotes=(remote,))
+        self.controller.remote_manager = type(
+            "RemoteManager",
+            (),
+            {
+                "connection_status": lambda _self, _remote_id: HerdrConnectionStatus(
+                    "remote-1",
+                    HerdrConnectionState.CONNECTED,
+                )
+            },
+        )()
+        self.addCleanup(setattr, self.controller, "settings", original_settings)
+        self.addCleanup(setattr, self.controller, "remote_manager", original_manager)
+
+        menu = sb.build_menu(
+            make_snapshot(statuses=[*local_statuses, remote_status]),
+            sb.STATE_WORKING,
+            self.controller,
+        )
+        titles = [item.title() for item in walk_menu(menu)]
+
+        self.assertTrue(any(title.startswith("Older remote task") for title in titles))
+
 
 class WindowBuildTests(StatusBarTestCase):
     """Settings and setup windows construct hundreds of views; a crash is a crash."""
@@ -376,10 +805,101 @@ class WindowBuildTests(StatusBarTestCase):
             self.controller.settings_fields,
             "settings window built no addressable fields; saving would be a no-op",
         )
+        self.assertIn("herdr_remote_selector", self.controller.settings_fields)
+        self.assertIn("herdr_remote_target", self.controller.settings_fields)
 
     def test_settings_window_is_not_visible(self):
         window = sb.build_settings_window(self.controller)
         self.assertFalse(window.isVisible(), "building a window must not show it")
+
+    def test_stale_remote_test_result_is_ignored(self):
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+        original = {
+            "remote_test_generation": self.controller.remote_test_generation,
+            "remote_test_in_flight": self.controller.remote_test_in_flight,
+            "remote_test_status": self.controller.remote_test_status,
+            "remote_tested_setting": self.controller.remote_tested_setting,
+        }
+        for name, value in original.items():
+            self.addCleanup(setattr, self.controller, name, value)
+        self.controller.remote_test_generation = 2
+        self.controller.remote_test_in_flight = True
+        self.controller.remote_test_status = "Current test"
+        self.controller.remote_tested_setting = None
+
+        self.controller.finishHerdrRemoteTest_(
+            {
+                "generation": 1,
+                "remote": remote,
+                "result": HerdrRemoteTestResult(
+                    setting=remote,
+                    connection=HerdrConnectionStatus(
+                        "remote-1",
+                        HerdrConnectionState.CONNECTED,
+                    ),
+                ),
+            }
+        )
+
+        self.assertTrue(self.controller.remote_test_in_flight)
+        self.assertEqual(self.controller.remote_test_status, "Current test")
+        self.assertIsNone(self.controller.remote_tested_setting)
+
+    def test_invalidating_remote_test_cancels_process_and_closes_draft_master(self):
+        class BlockingProcess:
+            def __init__(self):
+                self.terminated = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+        class RemoteManager:
+            def __init__(self):
+                self.closed = []
+
+            def close_control_master(
+                self,
+                remote,
+                *,
+                control_path=None,
+                wait=False,
+            ):
+                self.closed.append((remote, control_path, wait))
+
+        remote = HerdrRemoteSetting("draft-1", "Workbox", "workbox")
+        control_path = Path("/tmp/sidepulse-draft-control")
+        cancel_event = threading.Event()
+        process = BlockingProcess()
+        original = {
+            "settings": self.controller.settings,
+            "remote_manager": self.controller.remote_manager,
+            "remote_test_generation": self.controller.remote_test_generation,
+            "remote_test_in_flight": self.controller.remote_test_in_flight,
+            "remote_test_cancel_event": self.controller.remote_test_cancel_event,
+            "remote_test_process": self.controller.remote_test_process,
+            "remote_test_setting": self.controller.remote_test_setting,
+            "remote_test_control_path": self.controller.remote_test_control_path,
+        }
+        for name, value in original.items():
+            self.addCleanup(setattr, self.controller, name, value)
+        manager = RemoteManager()
+        self.controller.settings = AgentMonitorSettings()
+        self.controller.remote_manager = manager
+        self.controller.remote_test_in_flight = True
+        self.controller.remote_test_cancel_event = cancel_event
+        self.controller.remote_test_process = process
+        self.controller.remote_test_setting = remote
+        self.controller.remote_test_control_path = control_path
+
+        self.controller.invalidate_herdr_remote_test()
+
+        self.assertTrue(cancel_event.is_set())
+        self.assertTrue(process.terminated)
+        self.assertFalse(self.controller.remote_test_in_flight)
+        self.assertEqual(manager.closed, [(remote, control_path, False)])
 
 
 class IconTests(StatusBarTestCase):
@@ -389,7 +909,9 @@ class IconTests(StatusBarTestCase):
         for mode in AgentMode:
             with self.subTest(mode=mode.value):
                 status = make_status(mode=mode)
-                self.assertIsInstance(sb.session_row_icon_for_status(status), NSImage)
+                image = sb.session_row_icon_for_status(status)
+                self.assertIsInstance(image, NSImage)
+                self.assertFalse(image.isTemplate())
 
     def test_provider_icons_do_not_raise(self):
         for provider in ("claude", "codex", "grok", "nonsense"):
@@ -403,9 +925,143 @@ class IconTests(StatusBarTestCase):
                     sb.image_for_symbol(state.symbol, state.label), NSImage
                 )
 
+    def test_menu_icons_are_green(self):
+        image = sb.tinted_menu_icon(
+            sb.image_for_symbol(sb.STATE_DONE.symbol, sb.STATE_DONE.label)
+        )
+        bitmap = NSBitmapImageRep.imageRepWithData_(image.TIFFRepresentation())
+        opaque_colors = [
+            bitmap.colorAtX_y_(x, y)
+            for y in range(bitmap.pixelsHigh())
+            for x in range(bitmap.pixelsWide())
+            if bitmap.colorAtX_y_(x, y).alphaComponent() > 0.5
+        ]
+
+        self.assertTrue(opaque_colors)
+        for color in opaque_colors:
+            self.assertGreater(color.greenComponent(), color.redComponent())
+            self.assertGreater(color.greenComponent(), color.blueComponent())
+
 
 class PureUiLogicTests(unittest.TestCase):
     """Label and formatting helpers -- no AppKit objects, fast and exhaustive."""
+
+    def test_remote_authentication_creates_reusable_control_master(self):
+        remote = HerdrRemoteSetting(
+            "remote-1",
+            "Workbox",
+            "user@workbox",
+        )
+        marker = Path("/tmp/sidepulse-auth-marker")
+        acknowledgement = Path("/tmp/sidepulse-auth-ack")
+        cancellation = Path("/tmp/sidepulse-auth-cancel")
+        control_path = Path("/tmp/sidepulse-auth-control")
+
+        command = sb.herdr_authentication_command(
+            remote,
+            marker,
+            acknowledgement,
+            cancellation,
+            control_path,
+        )
+        args = shlex.split(command)
+        script = args[2]
+
+        self.assertEqual(args[:2], ["/bin/sh", "-c"])
+        self.assertIn("BatchMode=no", script)
+        self.assertIn("ControlMaster=auto", script)
+        self.assertIn(
+            f"ControlPersist={sb.HERDR_SSH_CONTROL_PERSIST_SECONDS}",
+            script,
+        )
+        self.assertIn(
+            f"ServerAliveInterval={sb.HERDR_SSH_SERVER_ALIVE_INTERVAL_SECONDS}",
+            script,
+        )
+        self.assertIn(
+            f"ServerAliveCountMax={sb.HERDR_SSH_SERVER_ALIVE_COUNT_MAX}",
+            script,
+        )
+        self.assertIn('-- "user@workbox" true', script)
+        self.assertIn(str(control_path), script)
+        self.assertIn(str(marker), script)
+        self.assertIn(str(acknowledgement), script)
+        self.assertIn(str(cancellation), script)
+        self.assertIn('kill -TERM "$ssh_pid"', script)
+        self.assertIn("-O exit", script)
+        syntax = subprocess.run(
+            ["/bin/sh", "-n", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_remote_authentication_cancel_interrupts_terminal_ssh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            pid_file = root / "ssh.pid"
+            terminated_file = root / "ssh.terminated"
+            fake_ssh.write_text(
+                "#!/bin/sh\n"
+                'case " $* " in *" -O exit "*) exit 0;; esac\n'
+                'printf "%s" "$$" > "$FAKE_SSH_PID_FILE"\n'
+                'trap \'printf terminated > "$FAKE_SSH_TERM_FILE"; exit 143\' TERM\n'
+                "while :; do sleep 1; done\n",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+            remote = HerdrRemoteSetting(
+                "remote-1",
+                "Workbox",
+                "user@workbox",
+            )
+            marker = root / "marker"
+            acknowledgement = root / "acknowledgement"
+            cancellation = root / "cancellation"
+            control_path = root / "control"
+            command = sb.herdr_authentication_command(
+                remote,
+                marker,
+                acknowledgement,
+                cancellation,
+                control_path,
+            )
+            env = dict(os.environ)
+            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+            env["FAKE_SSH_PID_FILE"] = str(pid_file)
+            env["FAKE_SSH_TERM_FILE"] = str(terminated_file)
+            shell = ["/bin/sh", "-c", command]
+            if Path("/bin/csh").exists():
+                shell = ["/bin/csh", "-f", "-c", command]
+            process = subprocess.Popen(
+                shell,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=env,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 2
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(pid_file.exists())
+
+                cancellation.touch()
+                _, stderr = process.communicate(timeout=4)
+
+                self.assertTrue(terminated_file.exists(), stderr)
+                self.assertFalse(cancellation.exists())
+                self.assertFalse(marker.exists())
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=2)
 
     def test_format_byte_count_is_monotonic_and_labelled(self):
         for size in (0, 1, 1023, 1024, 1024**2, 1024**3, 1024**4):

@@ -152,6 +152,48 @@ The monitor currently supports:
 | Grok | `~/.grok/hooks/sidepulse.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/grok.jsonl` |
 | GitHub Copilot CLI | `${COPILOT_HOME:-~/.copilot}/hooks/sidepulse.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/copilot.jsonl` |
 
+#### Remote agents through Herdr
+
+The macOS status-bar app can also monitor agents running on a remote machine
+managed by Herdr. SidePulse runs no software and installs no hooks on the
+remote. It uses the SSH configuration that already works for Herdr and reads
+`herdr agent list` over its own background connection.
+
+To add a remote:
+
+1. Open **SidePulse > Settings > Remote Agents**.
+2. Select **Add** and enter the same SSH target used with Herdr, such as
+   `workbox` or `user@workbox`.
+3. Optionally enter a named Herdr session. Leave it blank for the default
+   session.
+4. Select **Test Connection**, then **Save**.
+
+SidePulse discovers Herdr in common remote installation locations, including
+Homebrew, Cargo, mise, Nix, and user-local paths. The Herdr UI may be used to
+start or reconnect the remote server, but it does not need to remain open for
+monitoring to continue.
+
+Background SSH runs non-interactively and honors the user's existing SSH
+aliases, keys, host verification, proxy configuration, and agent forwarding.
+If password, MFA, or host confirmation is required, SidePulse reports
+**Authentication required**; select **Authenticate in Terminal** to complete
+the interactive SSH step, after which monitoring retries automatically through
+a private local SSH control connection. SidePulse closes that connection when
+the remote is disabled or removed and when the app quits; passwords and other
+credentials are never stored by SidePulse.
+
+The Remote Agents settings tab reports whether each remote is connecting,
+connected, unavailable, missing Herdr, missing a running Herdr server, or
+returning a Herdr error or incompatible response. Remote agents are grouped
+under their remote in the menu and never offer local app, terminal, or VS Code
+session actions.
+
+For an installation outside the discovered locations, advanced users can set
+`herdr_path_override` to an absolute remote path in
+`${XDG_CONFIG_HOME:-~/.config}/sidepulse/agent-monitor/settings.json`. An
+override is tested by itself and is never replaced by automatic discovery.
+SidePulse stores no SSH credentials or private keys.
+
 #### Local reply classifier (Apple Silicon)
 
 Install the optional MLX dependency, then classify a message with the default
