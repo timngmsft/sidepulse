@@ -4,7 +4,7 @@ import shlex
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
-from .models import AgentStatus
+from .models import AgentStatus, SOURCE_KIND_HERDR_REMOTE
 
 SESSION_OPEN_APP = "app"
 SESSION_OPEN_TERMINAL = "terminal"
@@ -16,6 +16,8 @@ SESSION_OPEN_VSCODE_SURFACES = ("vscode", "vs code", "visual studio code")
 
 
 def session_deep_link(status: AgentStatus) -> str | None:
+    if status.source_kind == SOURCE_KIND_HERDR_REMOTE:
+        return None
     provider = status.provider.lower()
     session_id = status.session_id
 
@@ -27,6 +29,8 @@ def session_deep_link(status: AgentStatus) -> str | None:
 
 
 def session_vscode_link(status: AgentStatus) -> str | None:
+    if status.source_kind == SOURCE_KIND_HERDR_REMOTE:
+        return None
     if status.provider.lower() != "claude" or not status.session_id:
         return None
     return "vscode://anthropic.claude-code/open?" + urlencode(
@@ -36,6 +40,8 @@ def session_vscode_link(status: AgentStatus) -> str | None:
 
 
 def session_resume_command(status: AgentStatus) -> str | None:
+    if status.source_kind == SOURCE_KIND_HERDR_REMOTE:
+        return None
     if not status.session_id:
         return None
 
@@ -62,6 +68,8 @@ def default_session_open_action(status: AgentStatus) -> str:
 
 
 def preferred_session_open_actions(status: AgentStatus) -> tuple[str, ...]:
+    if status.source_kind == SOURCE_KIND_HERDR_REMOTE:
+        return ()
     origin = normalized_origin(status.origin)
     if origin:
         if any(surface in origin for surface in SESSION_OPEN_VSCODE_SURFACES):

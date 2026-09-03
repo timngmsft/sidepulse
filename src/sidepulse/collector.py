@@ -4,7 +4,7 @@ import json
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -15,6 +15,8 @@ from .models import (
     AgentStatus,
     AggregateStatus,
     HookEvent,
+    SOURCE_KIND_HERDR_REMOTE,
+    SOURCE_KIND_LOCAL,
     parse_datetime,
     provider_label,
 )
@@ -422,6 +424,43 @@ class LiveAgentMonitor:
             self.statuses_by_key[status.agent_id] = status
             self.write_latest_state()
 
+    def remove_source(self, source_kind: str, source_id: str) -> bool:
+        with self.lock:
+            removed = [
+                key
+                for key, status in self.statuses_by_key.items()
+                if status.source_kind == source_kind and status.source_id == source_id
+            ]
+            for key in removed:
+                self.statuses_by_key.pop(key, None)
+            return bool(removed)
+
+    def reconcile_source(
+        self,
+        source_kind: str,
+        source_id: str,
+        statuses: Iterable[AgentStatus],
+    ) -> bool:
+        incoming = tuple(statuses)
+        for status in incoming:
+            if status.source_kind != source_kind or status.source_id != source_id:
+                raise ValueError("Reconciled status does not match its source")
+
+        with self.lock:
+            existing = {
+                key: status
+                for key, status in self.statuses_by_key.items()
+                if status.source_kind == source_kind and status.source_id == source_id
+            }
+            replacement = {status.agent_id: status for status in incoming}
+            changed = existing != replacement
+            if not changed:
+                return False
+            for key in existing:
+                self.statuses_by_key.pop(key, None)
+            self.statuses_by_key.update(replacement)
+            return True
+
     def snapshot(self, include_stale: bool = False) -> MonitorSnapshot:
         now = datetime.now(timezone.utc)
         with self.lock:
@@ -451,7 +490,7 @@ class LiveAgentMonitor:
         loaded: dict[str, AgentStatus] = {}
         for status_data in statuses:
             status = agent_status_from_dict(status_data)
-            if status is not None:
+            if status is not None and status.source_kind != SOURCE_KIND_HERDR_REMOTE:
                 loaded[status.agent_id] = status
         self.statuses_by_key.update(loaded)
 
@@ -462,7 +501,9 @@ class LiveAgentMonitor:
         payload = {
             "updated_at": now.isoformat(),
             "statuses": [
-                status.to_dict(now) for status in self.statuses_by_key.values()
+                status.to_dict(now)
+                for status in self.statuses_by_key.values()
+                if status.source_kind != SOURCE_KIND_HERDR_REMOTE
             ],
         }
         try:
@@ -1261,12 +1302,18 @@ def status_is_stale(
     idle_visible_seconds: float,
 ) -> bool:
     age = status.age_seconds(now)
+    freshness_age = status.freshness_age_seconds(now)
     if status.mode == AgentMode.COMPLETED and completed_visible_seconds >= 0:
         return age > completed_visible_seconds
     if status.mode == AgentMode.IDLE_READY and idle_visible_seconds >= 0:
         return age > idle_visible_seconds
+    if (
+        status.source_kind == SOURCE_KIND_HERDR_REMOTE
+        and status.mode == AgentMode.WAITING_FOR_INPUT
+    ):
+        return age > stale_after_seconds
     return (
-        age > stale_after_seconds
+        freshness_age > stale_after_seconds
         or (
             status.mode == AgentMode.TOOL_RUNNING
             and tool_running_timeout_seconds > 0
@@ -1325,6 +1372,13 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
             message=_string_or_none(data.get("message")),
             origin=_string_or_none(data.get("origin")),
             stale=bool(data.get("stale", False)),
+            last_observed_at=(
+                parse_datetime(data.get("last_observed_at"), updated_at)
+                if data.get("last_observed_at") is not None
+                else None
+            ),
+            source_kind=_string_or_none(data.get("source_kind")) or SOURCE_KIND_LOCAL,
+            source_id=_string_or_none(data.get("source_id")),
         )
     except Exception:
         return None
@@ -1442,39 +1496,13 @@ def read_recent_lines(path: Path, max_lines: int) -> list[str]:
 def _replace_stale(status: AgentStatus, stale: bool) -> AgentStatus:
     if status.stale == stale:
         return status
-    return AgentStatus(
-        provider=status.provider,
-        agent_id=status.agent_id,
-        display_name=status.display_name,
-        mode=status.mode,
-        updated_at=status.updated_at,
-        event_name=status.event_name,
-        session_id=status.session_id,
-        cwd=status.cwd,
-        tool_name=status.tool_name,
-        message=status.message,
-        origin=status.origin,
-        stale=stale,
-    )
+    return replace(status, stale=stale)
 
 
 def _replace_mode(status: AgentStatus, mode: AgentMode) -> AgentStatus:
     if status.mode == mode:
         return status
-    return AgentStatus(
-        provider=status.provider,
-        agent_id=status.agent_id,
-        display_name=status.display_name,
-        mode=mode,
-        updated_at=status.updated_at,
-        event_name=status.event_name,
-        session_id=status.session_id,
-        cwd=status.cwd,
-        tool_name=status.tool_name,
-        message=status.message,
-        origin=status.origin,
-        stale=status.stale,
-    )
+    return replace(status, mode=mode)
 
 
 def title_from_event(record: HookEvent) -> str | None:

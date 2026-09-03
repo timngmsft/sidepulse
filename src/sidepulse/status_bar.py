@@ -5,7 +5,8 @@ import shlex
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +22,7 @@ try:
         NSButton,
         NSButtonTypeSwitch,
         NSColor,
+        NSCompositingOperationSourceIn,
         NSCompositingOperationSourceOver,
         NSFont,
         NSFontAttributeName,
@@ -32,12 +34,15 @@ try:
         NSOnState,
         NSOpenPanel,
         NSPopUpButton,
+        NSRectFillUsingOperation,
         NSScrollView,
         NSSavePanel,
         NSSlider,
         NSStatusBar,
         NSTabView,
         NSTabViewItem,
+        NSTerminateLater,
+        NSTerminateNow,
         NSTextField,
         NSTextView,
         NSView,
@@ -122,7 +127,12 @@ from .lid_sleep import (
     sleep_helper_install_command,
     sleep_helper_installed,
 )
-from .models import AgentMode, AgentStatus, provider_label
+from .models import (
+    AgentMode,
+    AgentStatus,
+    SOURCE_KIND_HERDR_REMOTE,
+    provider_label,
+)
 from .providers import (
     ProviderConfig,
     detect_claude_config,
@@ -137,6 +147,24 @@ from .sd_eject_guard_launch import (
     install_sd_eject_guard,
     sd_eject_guard_installed,
     uninstall_sd_eject_guard,
+)
+from .remote_herdr import (
+    HERDR_CONNECTION_LABELS,
+    HERDR_SSH_CONTROL_PERSIST_SECONDS,
+    HERDR_SSH_SERVER_ALIVE_COUNT_MAX,
+    HERDR_SSH_SERVER_ALIVE_INTERVAL_SECONDS,
+    HerdrAuthenticationRequired,
+    HerdrConnectionState,
+    HerdrInvalidPathOverride,
+    HerdrNotInstalled,
+    HerdrRemoteManager,
+    HerdrRemoteTestResult,
+    HerdrTransportError,
+    HerdrUnsupportedPlatform,
+    herdr_ssh_control_path,
+    normalize_herdr_session,
+    validate_remote_setting,
+    validate_ssh_target,
 )
 from .session_actions import (
     SESSION_OPEN_APP,
@@ -176,6 +204,7 @@ from .settings import (
     TERMINAL_APP_CHOICES,
     TERMINAL_APP_WARP,
     TERMINAL_APP_WEZTERM,
+    HerdrRemoteSetting,
     LedAnimationSetting,
     default_settings_path,
     default_lid_animation,
@@ -221,6 +250,16 @@ class TerminalSessionHints:
     cwd: str
     title: str
     match_title: str = ""
+
+
+@dataclass(frozen=True)
+class HerdrAuthenticationAttempt:
+    remote: HerdrRemoteSetting
+    token: str
+    marker: Path
+    acknowledgement: Path
+    cancellation: Path
+    control_path: Path
 
 
 STATE_IDLE = StatusBarState("Idle", "circle", 4)
@@ -350,6 +389,29 @@ class StatusBarController(NSObject):
 
         self.settings = load_settings()
         self.monitor = self.build_monitor()
+        self.remote_refresh_pending = False
+        self.remote_manager_started = False
+        self.remote_editing_id = (
+            self.settings.herdr_remotes[0].remote_id
+            if self.settings.herdr_remotes
+            else None
+        )
+        self.remote_creating = not bool(self.settings.herdr_remotes)
+        self.remote_draft_id = None
+        self.remote_tested_setting = None
+        self.remote_test_status = ""
+        self.remote_test_in_flight = False
+        self.remote_test_generation = 0
+        self.remote_test_cancel_event = None
+        self.remote_test_process = None
+        self.remote_test_setting = None
+        self.remote_test_control_path = None
+        self.remote_test_threads = set()
+        self.remote_auth_attempts = {}
+        self.remote_operation_lock = threading.RLock()
+        self.termination_cleanup_started = False
+        self.termination_cleanup_finished = False
+        self.remote_manager = self.build_remote_manager()
         self.event_server = None
         self.status_item = None
         self.timer = None
@@ -450,6 +512,8 @@ class StatusBarController(NSObject):
             self.virtual_status_device.show()
         else:
             self.virtual_status_device.hide()
+        self.remote_manager_started = True
+        self.remote_manager.apply_settings(self.settings.herdr_remotes)
 
     @objc.IBAction
     def refresh_(self, _sender):
@@ -773,12 +837,100 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def quit_(self, _sender):
+        NSApp.terminate_(self)
+
+    def applicationShouldTerminate_(self, _sender):
+        if self.termination_cleanup_finished:
+            return NSTerminateNow
+        if self.termination_cleanup_started:
+            return NSTerminateLater
+
+        self.termination_cleanup_started = True
+        self.remote_manager_started = False
+        self.stop_event_server()
         self.closed_lid_awake.release()
         self.keep_awake.release()
-        NSApp.terminate_(self)
+        test_cleanup = self.invalidate_herdr_remote_test(
+            close_control_master=False
+        )
+        auth_attempts = self.cancel_all_herdr_authentication(
+            close_control_masters=False
+        )
+        with self.remote_operation_lock:
+            test_threads = tuple(self.remote_test_threads)
+        thread = threading.Thread(
+            target=self.finish_application_cleanup,
+            args=(test_cleanup, auth_attempts, test_threads),
+            daemon=True,
+        )
+        thread.start()
+        return NSTerminateLater
+
+    def finish_application_cleanup(
+        self,
+        test_cleanup: tuple[HerdrRemoteSetting, Path] | None,
+        auth_attempts: tuple[HerdrAuthenticationAttempt, ...],
+        test_threads: tuple[threading.Thread, ...],
+    ) -> None:
+        cleanup_errors: list[Exception] = []
+        for thread in test_threads:
+            try:
+                thread.join()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        try:
+            self.remote_manager.stop(close_control_masters=True, wait=True)
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        cleanup_targets = [
+            (attempt.remote, attempt.control_path)
+            for attempt in auth_attempts
+        ]
+        if test_cleanup is not None:
+            cleanup_targets.append(test_cleanup)
+        seen: set[tuple[str, str]] = set()
+        for remote, control_path in cleanup_targets:
+            key = (remote.ssh_target, str(control_path))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                self.remote_manager.close_control_master(
+                    remote,
+                    control_path=control_path,
+                    wait=True,
+                )
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            error_types = ", ".join(
+                sorted({type(exc).__name__ for exc in cleanup_errors})
+            )
+            log_status_bar(
+                f"remote shutdown cleanup failed ({error_types})"
+            )
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "completeApplicationTermination:",
+            None,
+            False,
+        )
+
+    def completeApplicationTermination_(self, _sender):
+        self.termination_cleanup_finished = True
+        NSApp.replyToApplicationShouldTerminate_(True)
 
     def applicationWillTerminate_(self, _notification):
         self.stop_event_server()
+        self.remote_manager_started = False
+        if not self.termination_cleanup_started:
+            self.invalidate_herdr_remote_test(close_control_master=False)
+            self.cancel_all_herdr_authentication(
+                close_control_masters=False
+            )
+            self.remote_manager.stop(
+                close_control_masters=True,
+                wait=False,
+            )
         self.closed_lid_awake.release()
         self.keep_awake.release()
 
@@ -804,8 +956,23 @@ class StatusBarController(NSObject):
             latest_state_path=default_latest_state_path(),
         )
 
+    def build_remote_manager(self) -> HerdrRemoteManager:
+        return HerdrRemoteManager(
+            self.monitor,
+            on_refresh=self.schedule_remote_refresh,
+            on_resolved_path=self.handle_remote_resolved_path,
+        )
+
     def reload_monitor(self) -> None:
+        was_started = self.remote_manager_started
         self.monitor = self.build_monitor()
+        if was_started:
+            self.remote_manager.restart(
+                self.monitor,
+                self.settings.herdr_remotes,
+            )
+        else:
+            self.remote_manager.monitor = self.monitor
 
     def start_event_server(self) -> None:
         self.stop_event_server()
@@ -848,6 +1015,82 @@ class StatusBarController(NSObject):
     def refreshFromEvent_(self, _sender):
         self.event_refresh_pending = False
         self.refresh_(None)
+
+    def schedule_remote_refresh(self) -> None:
+        if not self.remote_manager_started or self.remote_refresh_pending:
+            return
+        self.remote_refresh_pending = True
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "refreshFromRemote:",
+            None,
+            False,
+        )
+
+    @objc.IBAction
+    def refreshFromRemote_(self, _sender):
+        self.remote_refresh_pending = False
+        self.refresh_(None)
+        if (
+            not self.remote_test_in_flight
+            and self.selected_herdr_remote() is not None
+            and self.current_herdr_remote_id() not in self.remote_auth_attempts
+        ):
+            self.remote_test_status = ""
+        self.refresh_remote_connection_labels()
+
+    def handle_remote_resolved_path(
+        self,
+        remote_id: str,
+        generation: int,
+        path: str | None,
+    ) -> None:
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "applyRemoteResolvedPath:",
+            {
+                "remote_id": remote_id,
+                "generation": generation,
+                "path": path,
+            },
+            False,
+        )
+
+    @objc.IBAction
+    def applyRemoteResolvedPath_(self, payload):
+        if not isinstance(payload, dict):
+            return
+        remote_id = payload.get("remote_id")
+        generation = payload.get("generation")
+        path = payload.get("path")
+        if (
+            not isinstance(remote_id, str)
+            or not isinstance(generation, int)
+            or (
+            path is not None and not isinstance(path, str)
+            )
+        ):
+            return
+        if not self.remote_manager.resolved_path_is_current(
+            remote_id,
+            generation,
+            path,
+        ):
+            return
+        remote = self.settings.herdr_remote(remote_id)
+        if (
+            remote is None
+            or remote.herdr_path_override
+            or remote.resolved_herdr_path == path
+        ):
+            return
+        try:
+            self.settings = self.settings.with_herdr_remote(
+                remote.with_resolved_path(path)
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            log_status_bar(f"remote path persistence error: {exc}")
+            return
+        self.refresh_remote_connection_labels()
 
     def show_settings_window(self) -> None:
         if self.settings_window is None:
@@ -1087,6 +1330,7 @@ class StatusBarController(NSObject):
                 timeframe_popup,
                 self.settings.history_timeframe_seconds,
             )
+        self.refresh_remote_settings_controls()
         self.refresh_history_chart()
 
     def refresh_history_chart(self) -> None:
@@ -1115,6 +1359,696 @@ class StatusBarController(NSObject):
         set_field_value(self.settings_fields.get("message"), message)
         if message:
             log_status_bar(f"settings: {message}")
+
+    def set_remote_settings_message(self, message: str) -> None:
+        set_field_value(self.settings_fields.get("message"), message)
+
+    def selected_herdr_remote(self) -> HerdrRemoteSetting | None:
+        if self.remote_creating or self.remote_editing_id is None:
+            return None
+        return self.settings.herdr_remote(self.remote_editing_id)
+
+    def current_herdr_remote_id(self) -> str | None:
+        return self.remote_draft_id if self.remote_creating else self.remote_editing_id
+
+    def invalidate_herdr_remote_test(
+        self,
+        *,
+        close_control_master: bool = True,
+    ) -> tuple[HerdrRemoteSetting, Path] | None:
+        with self.remote_operation_lock:
+            self.remote_test_generation += 1
+            cancel_event = self.remote_test_cancel_event
+            process = self.remote_test_process
+            remote = self.remote_test_setting
+            control_path = self.remote_test_control_path
+            self.remote_test_in_flight = False
+            self.remote_test_cancel_event = None
+            self.remote_test_process = None
+            self.remote_test_setting = None
+            self.remote_test_control_path = None
+        if cancel_event is not None:
+            cancel_event.set()
+        terminate_remote_process(process)
+        cleanup = (
+            (remote, control_path)
+            if remote is not None and control_path is not None
+            else None
+        )
+        if (
+            close_control_master
+            and cleanup is not None
+            and not self.herdr_control_path_is_managed(remote, control_path)
+        ):
+            self.remote_manager.close_control_master(
+                remote,
+                control_path=control_path,
+            )
+        return cleanup
+
+    def observe_herdr_remote_test_process(
+        self,
+        generation: int,
+        process,
+    ) -> None:
+        should_terminate = False
+        with self.remote_operation_lock:
+            if generation != self.remote_test_generation:
+                should_terminate = process is not None
+            else:
+                self.remote_test_process = process
+        if should_terminate:
+            terminate_remote_process(process)
+
+    def herdr_control_path_is_managed(
+        self,
+        remote: HerdrRemoteSetting,
+        control_path: Path,
+    ) -> bool:
+        saved = self.settings.herdr_remote(remote.remote_id)
+        if (
+            not self.remote_manager_started
+            or saved is None
+            or not saved.enabled
+            or saved.ssh_target != remote.ssh_target
+        ):
+            return False
+        return self.remote_manager.control_path_for(saved) == control_path
+
+    def herdr_remote_editor_matches(self, remote: HerdrRemoteSetting) -> bool:
+        editor_id = self.current_herdr_remote_id()
+        if editor_id != remote.remote_id:
+            return False
+        target = text_control_value(
+            self.settings_fields.get("herdr_remote_target")
+        ).strip()
+        try:
+            session = normalize_herdr_session(
+                text_control_value(
+                    self.settings_fields.get("herdr_remote_session")
+                )
+            )
+        except ValueError:
+            return False
+        return target == remote.ssh_target and session == remote.session
+
+    def refresh_remote_settings_controls(self) -> None:
+        selector = self.settings_fields.get("herdr_remote_selector")
+        if selector is None:
+            return
+
+        selector.removeAllItems()
+        for remote in self.settings.herdr_remotes:
+            selector.addItemWithTitle_(remote.name)
+            selector.lastItem().setRepresentedObject_(remote.remote_id)
+
+        selected = self.selected_herdr_remote()
+        if selected is None and not self.remote_creating and self.settings.herdr_remotes:
+            selected = self.settings.herdr_remotes[0]
+            self.remote_editing_id = selected.remote_id
+        if self.remote_creating or selected is None:
+            selector.addItemWithTitle_("New remote")
+            selector.lastItem().setRepresentedObject_(None)
+            selector.selectItemAtIndex_(selector.numberOfItems() - 1)
+            set_text_control_value(self.settings_fields.get("herdr_remote_name"), "")
+            set_text_control_value(self.settings_fields.get("herdr_remote_target"), "")
+            set_text_control_value(self.settings_fields.get("herdr_remote_session"), "")
+            set_checkbox_state(self.settings_buttons.get("herdr_remote_enabled"), True)
+        else:
+            for index in range(selector.numberOfItems()):
+                item = selector.itemAtIndex_(index)
+                if item.representedObject() == selected.remote_id:
+                    selector.selectItemAtIndex_(index)
+                    break
+            set_text_control_value(
+                self.settings_fields.get("herdr_remote_name"),
+                selected.name,
+            )
+            set_text_control_value(
+                self.settings_fields.get("herdr_remote_target"),
+                selected.ssh_target,
+            )
+            set_text_control_value(
+                self.settings_fields.get("herdr_remote_session"),
+                selected.session,
+            )
+            set_checkbox_state(
+                self.settings_buttons.get("herdr_remote_enabled"),
+                selected.enabled,
+            )
+
+        remove_button = self.settings_buttons.get("herdr_remote_remove")
+        retry_button = self.settings_buttons.get("herdr_remote_retry")
+        if remove_button is not None:
+            remove_button.setEnabled_(selected is not None)
+        if retry_button is not None:
+            retry_button.setEnabled_(selected is not None and selected.enabled)
+        self.refresh_remote_connection_labels()
+
+    def refresh_remote_connection_labels(self) -> None:
+        if self.settings_fields.get("herdr_remote_status") is None:
+            return
+        remote = self.selected_herdr_remote()
+        status_text = self.remote_test_status
+        path_text = ""
+        last_update_text = ""
+        if (
+            not status_text
+            and self.current_herdr_remote_id() in self.remote_auth_attempts
+        ):
+            status_text = "Complete authentication in Terminal."
+        if remote is not None:
+            connection = self.remote_manager.connection_status(remote.remote_id)
+            if not status_text and connection is not None:
+                status_text = connection.label
+                if connection.message:
+                    status_text = f"{status_text}: {connection.message}"
+            effective_path = (
+                remote.herdr_path_override or remote.resolved_herdr_path
+            )
+            path_text = effective_path or "Not resolved"
+            if connection is not None and connection.last_success_at is not None:
+                last_update_text = connection.last_success_at.astimezone().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+        elif not status_text:
+            status_text = "Enter a remote and test the connection."
+
+        set_field_value(
+            self.settings_fields.get("herdr_remote_status"),
+            status_text,
+        )
+        set_field_value(
+            self.settings_fields.get("herdr_remote_path"),
+            f"Herdr: {path_text}" if path_text else "",
+        )
+        set_field_value(
+            self.settings_fields.get("herdr_remote_last_update"),
+            f"Last update: {last_update_text}" if last_update_text else "",
+        )
+
+    def herdr_remote_from_fields(self) -> HerdrRemoteSetting:
+        name = text_control_value(
+            self.settings_fields.get("herdr_remote_name")
+        ).strip()
+        target = validate_ssh_target(
+            text_control_value(
+                self.settings_fields.get("herdr_remote_target")
+            )
+        )
+        session = normalize_herdr_session(
+            text_control_value(
+                self.settings_fields.get("herdr_remote_session")
+            )
+        )
+        enabled = checkbox_is_on(
+            self.settings_buttons.get("herdr_remote_enabled")
+        )
+        existing = self.selected_herdr_remote()
+        if existing is None:
+            remote_id = self.remote_draft_id or str(uuid.uuid4())
+            self.remote_draft_id = remote_id
+            remote = HerdrRemoteSetting(
+                remote_id=remote_id,
+                name=name or target,
+                ssh_target=target,
+                session=session,
+                enabled=enabled,
+            )
+        else:
+            resolved = existing.resolved_herdr_path
+            if existing.ssh_target != target:
+                resolved = None
+            remote = replace(
+                existing,
+                name=name or target,
+                ssh_target=target,
+                session=session,
+                enabled=enabled,
+                resolved_herdr_path=resolved,
+            )
+
+        tested = self.remote_tested_setting
+        if (
+            tested is not None
+            and tested.remote_id == remote.remote_id
+            and tested.ssh_target == remote.ssh_target
+            and tested.session == remote.session
+            and tested.herdr_path_override == remote.herdr_path_override
+        ):
+            remote = replace(
+                remote,
+                resolved_herdr_path=tested.resolved_herdr_path,
+            )
+        return validate_remote_setting(remote)
+
+    @objc.IBAction
+    def selectHerdrRemote_(self, sender):
+        current_remote_id = self.current_herdr_remote_id()
+        self.invalidate_herdr_remote_test()
+        if current_remote_id is not None:
+            self.cancel_herdr_authentication(current_remote_id)
+        selected = sender.selectedItem()
+        remote_id = selected.representedObject() if selected is not None else None
+        self.remote_creating = not isinstance(remote_id, str)
+        self.remote_editing_id = remote_id if isinstance(remote_id, str) else None
+        self.remote_draft_id = None
+        self.remote_tested_setting = None
+        self.remote_test_status = ""
+        self.refresh_remote_settings_controls()
+
+    @objc.IBAction
+    def addHerdrRemote_(self, _sender):
+        current_remote_id = self.current_herdr_remote_id()
+        self.invalidate_herdr_remote_test()
+        if current_remote_id is not None:
+            self.cancel_herdr_authentication(current_remote_id)
+        self.remote_creating = True
+        self.remote_editing_id = None
+        self.remote_draft_id = None
+        self.remote_tested_setting = None
+        self.remote_test_status = ""
+        self.refresh_remote_settings_controls()
+
+    @objc.IBAction
+    def saveHerdrRemote_(self, _sender):
+        try:
+            remote = self.herdr_remote_from_fields()
+            updated_settings = self.settings.with_herdr_remote(remote)
+            save_settings(updated_settings)
+        except Exception as exc:
+            self.remote_test_status = f"Could not save remote: {exc}"
+            self.refresh_remote_connection_labels()
+            return
+        self.settings = updated_settings
+
+        self.remote_creating = False
+        self.remote_editing_id = remote.remote_id
+        self.remote_draft_id = None
+        self.invalidate_herdr_remote_test()
+        self.remote_test_status = ""
+        self.remote_tested_setting = None
+        if self.remote_manager_started:
+            self.remote_manager.apply_settings(self.settings.herdr_remotes)
+        with self.remote_operation_lock:
+            attempt = self.remote_auth_attempts.get(remote.remote_id)
+        if (
+            attempt is not None
+            and (
+                not remote.enabled
+                or attempt.remote.ssh_target != remote.ssh_target
+                or attempt.remote.session != remote.session
+            )
+        ):
+            self.cancel_herdr_authentication(remote.remote_id)
+        self.refresh_remote_settings_controls()
+        self.set_remote_settings_message(f"{remote.name}: remote settings saved.")
+        self.refresh_(None)
+
+    @objc.IBAction
+    def removeHerdrRemote_(self, _sender):
+        remote = self.selected_herdr_remote()
+        if remote is None:
+            return
+        try:
+            updated_settings = self.settings.without_herdr_remote(
+                remote.remote_id
+            )
+            save_settings(updated_settings)
+        except Exception as exc:
+            self.remote_test_status = f"Could not remove remote: {exc}"
+            self.refresh_remote_connection_labels()
+            return
+        self.settings = updated_settings
+        if self.remote_manager_started:
+            self.remote_manager.apply_settings(self.settings.herdr_remotes)
+        self.invalidate_herdr_remote_test()
+        self.cancel_herdr_authentication(remote.remote_id)
+        self.remote_editing_id = (
+            self.settings.herdr_remotes[0].remote_id
+            if self.settings.herdr_remotes
+            else None
+        )
+        self.remote_creating = not bool(self.settings.herdr_remotes)
+        self.remote_tested_setting = None
+        self.remote_test_status = ""
+        self.refresh_remote_settings_controls()
+        self.set_remote_settings_message(f"{remote.name}: remote removed.")
+        self.refresh_(None)
+
+    @objc.IBAction
+    def testHerdrRemote_(self, _sender):
+        try:
+            remote = self.herdr_remote_from_fields()
+            self.start_herdr_remote_test(remote)
+        except Exception as exc:
+            self.remote_test_status = f"Test failed: {exc}"
+            self.refresh_remote_connection_labels()
+
+    def start_herdr_remote_test(self, remote: HerdrRemoteSetting) -> None:
+        self.invalidate_herdr_remote_test()
+        cancel_event = threading.Event()
+        control_path = self.remote_manager.control_path_for(remote)
+        with self.remote_operation_lock:
+            generation = self.remote_test_generation
+            self.remote_test_in_flight = True
+            self.remote_test_cancel_event = cancel_event
+            self.remote_test_setting = remote
+            self.remote_test_control_path = control_path
+        self.remote_test_status = "Testing connection..."
+        self.refresh_remote_connection_labels()
+        thread = threading.Thread(
+            target=self.herdr_remote_test_worker,
+            args=(remote, generation, cancel_event, control_path),
+            daemon=True,
+        )
+        with self.remote_operation_lock:
+            self.remote_test_threads.add(thread)
+        thread.start()
+
+    def herdr_remote_test_worker(
+        self,
+        remote: HerdrRemoteSetting,
+        generation: int,
+        cancel_event: threading.Event,
+        control_path: Path,
+    ) -> None:
+        payload: dict[str, object] = {
+            "remote": remote,
+            "generation": generation,
+        }
+        try:
+            payload["result"] = self.remote_manager.test_remote(
+                remote,
+                control_path=control_path,
+                cancel_event=cancel_event,
+                process_observer=lambda process: (
+                    self.observe_herdr_remote_test_process(
+                        generation,
+                        process,
+                    )
+                ),
+            )
+        except Exception as exc:
+            payload["error"] = exc
+        finally:
+            cancelled = cancel_event.is_set()
+            with self.remote_operation_lock:
+                stale = generation != self.remote_test_generation
+            if (
+                (cancelled or stale)
+                and not self.herdr_control_path_is_managed(
+                    remote,
+                    control_path,
+                )
+            ):
+                self.remote_manager.close_control_master(
+                    remote,
+                    control_path=control_path,
+                    wait=True,
+                )
+            with self.remote_operation_lock:
+                self.remote_test_threads.discard(threading.current_thread())
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "finishHerdrRemoteTest:",
+            payload,
+            False,
+        )
+
+    @objc.IBAction
+    def finishHerdrRemoteTest_(self, payload):
+        if not isinstance(payload, dict):
+            return
+        generation = payload.get("generation")
+        if generation != self.remote_test_generation:
+            return
+        with self.remote_operation_lock:
+            self.remote_test_in_flight = False
+            self.remote_test_cancel_event = None
+            self.remote_test_process = None
+        remote = payload.get("remote")
+        result = payload.get("result")
+        error = payload.get("error")
+        if not isinstance(remote, HerdrRemoteSetting):
+            return
+        if not self.herdr_remote_editor_matches(remote):
+            self.remote_tested_setting = None
+            self.remote_test_status = "Connection settings changed; test again."
+            self.refresh_remote_connection_labels()
+            return
+        if isinstance(result, HerdrRemoteTestResult):
+            self.remote_tested_setting = result.setting
+            self.remote_test_status = result.connection.label
+            if result.connection.message:
+                self.remote_test_status += f": {result.connection.message}"
+        elif isinstance(error, Exception):
+            state = herdr_connection_state_for_error(error)
+            self.remote_test_status = HERDR_CONNECTION_LABELS[state]
+            if str(error):
+                self.remote_test_status += f": {error}"
+        else:
+            self.remote_test_status = "Test failed."
+        self.refresh_remote_connection_labels()
+
+    @objc.IBAction
+    def retryHerdrRemote_(self, _sender):
+        remote = self.selected_herdr_remote()
+        if remote is None or not remote.enabled:
+            return
+        self.invalidate_herdr_remote_test()
+        self.remote_test_status = ""
+        self.remote_manager.retry(remote.remote_id)
+        self.refresh_remote_connection_labels()
+
+    @objc.IBAction
+    def authenticateHerdrRemote_(self, _sender):
+        try:
+            remote = self.herdr_remote_from_fields()
+        except Exception as exc:
+            self.remote_test_status = f"Authentication failed: {exc}"
+            self.refresh_remote_connection_labels()
+            return
+
+        self.cancel_herdr_authentication(remote.remote_id)
+        token = uuid.uuid4().hex
+        marker = default_state_dir() / f"remote-auth-{token}.ok"
+        acknowledgement = default_state_dir() / f"remote-auth-{token}.ack"
+        cancellation = default_state_dir() / f"remote-auth-{token}.cancel"
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            control_path = herdr_ssh_control_path(
+                remote.remote_id,
+                remote.ssh_target,
+                token,
+            )
+            attempt = HerdrAuthenticationAttempt(
+                remote=remote,
+                token=token,
+                marker=marker,
+                acknowledgement=acknowledgement,
+                cancellation=cancellation,
+                control_path=control_path,
+            )
+            command = herdr_authentication_command(
+                remote,
+                marker,
+                acknowledgement,
+                cancellation,
+                control_path,
+            )
+        except OSError as exc:
+            self.remote_test_status = f"Could not prepare authentication: {exc}"
+            self.refresh_remote_connection_labels()
+            return
+        except HerdrTransportError as exc:
+            self.remote_test_status = f"Could not prepare authentication: {exc}"
+            self.refresh_remote_connection_labels()
+            return
+        with self.remote_operation_lock:
+            self.remote_auth_attempts[remote.remote_id] = attempt
+        try:
+            open_terminal_command(
+                command,
+                terminal_app=self.settings.session_terminal_app,
+                custom_terminal_path=self.settings.custom_terminal_path,
+            )
+        except Exception as exc:
+            self.cancel_herdr_authentication(remote.remote_id)
+            self.remote_test_status = f"Could not open authentication: {exc}"
+            self.refresh_remote_connection_labels()
+            return
+        self.remote_test_status = "Complete authentication in Terminal."
+        self.refresh_remote_connection_labels()
+        thread = threading.Thread(
+            target=self.wait_for_herdr_authentication,
+            args=(attempt,),
+            daemon=True,
+        )
+        thread.start()
+
+    def wait_for_herdr_authentication(
+        self,
+        attempt: HerdrAuthenticationAttempt,
+    ) -> None:
+        deadline = time.monotonic() + 10 * 60
+        while time.monotonic() < deadline:
+            with self.remote_operation_lock:
+                current = self.remote_auth_attempts.get(
+                    attempt.remote.remote_id
+                )
+            if current != attempt:
+                return
+            if attempt.marker.exists():
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "resumeHerdrRemoteAfterAuth:",
+                    {
+                        "remote_id": attempt.remote.remote_id,
+                        "token": attempt.token,
+                    },
+                    False,
+                )
+                return
+            time.sleep(1)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "expireHerdrRemoteAuthentication:",
+            {
+                "remote_id": attempt.remote.remote_id,
+                "token": attempt.token,
+            },
+            False,
+        )
+
+    @objc.IBAction
+    def resumeHerdrRemoteAfterAuth_(self, payload):
+        if not isinstance(payload, dict):
+            return
+        remote_id = payload.get("remote_id")
+        token = payload.get("token")
+        if not isinstance(remote_id, str) or not isinstance(token, str):
+            return
+        with self.remote_operation_lock:
+            attempt = self.remote_auth_attempts.get(remote_id)
+        if attempt is None or attempt.token != token:
+            return
+        remote = attempt.remote
+        saved = self.settings.herdr_remote(remote.remote_id)
+        saved_matches = (
+            saved is not None
+            and saved.ssh_target == remote.ssh_target
+            and saved.session == remote.session
+            and saved.herdr_path_override == remote.herdr_path_override
+        )
+        editor_matches = self.herdr_remote_editor_matches(remote)
+        resume_saved = bool(
+            saved_matches
+            and saved is not None
+            and saved.enabled
+            and self.remote_manager_started
+        )
+        if not resume_saved and not editor_matches:
+            self.cancel_herdr_authentication(remote.remote_id)
+            return
+
+        previous_control_path = self.remote_manager.adopt_control_path(
+            remote,
+            attempt.control_path,
+        )
+        try:
+            attempt.acknowledgement.touch()
+        except OSError:
+            if previous_control_path is not None:
+                self.remote_manager.adopt_control_path(
+                    remote,
+                    previous_control_path,
+                )
+            self.cancel_herdr_authentication(remote.remote_id)
+            return
+        try:
+            if resume_saved:
+                self.remote_manager.retry(remote.remote_id)
+                self.schedule_remote_refresh()
+            else:
+                self.remote_test_status = ""
+                self.start_herdr_remote_test(remote)
+        except Exception as exc:
+            if previous_control_path is not None:
+                self.remote_manager.adopt_control_path(
+                    remote,
+                    previous_control_path,
+                )
+            self.cancel_herdr_authentication(remote.remote_id)
+            self.remote_test_status = f"Could not resume remote: {exc}"
+            self.refresh_remote_connection_labels()
+            return
+        with self.remote_operation_lock:
+            self.remote_auth_attempts.pop(remote.remote_id, None)
+        if (
+            previous_control_path is not None
+            and previous_control_path != attempt.control_path
+        ):
+            self.remote_manager.close_control_master(
+                remote,
+                control_path=previous_control_path,
+            )
+        self.refresh_remote_connection_labels()
+
+    @objc.IBAction
+    def expireHerdrRemoteAuthentication_(self, payload):
+        if not isinstance(payload, dict):
+            return
+        remote_id = payload.get("remote_id")
+        token = payload.get("token")
+        if not isinstance(remote_id, str) or not isinstance(token, str):
+            return
+        with self.remote_operation_lock:
+            attempt = self.remote_auth_attempts.get(remote_id)
+        if attempt is None or attempt.token != token:
+            return
+        self.cancel_herdr_authentication(remote_id)
+        if self.herdr_remote_editor_matches(attempt.remote):
+            self.remote_test_status = "Authentication timed out."
+            self.refresh_remote_connection_labels()
+
+    def cancel_herdr_authentication(
+        self,
+        remote_id: str,
+        *,
+        close_control_master: bool = True,
+    ) -> HerdrAuthenticationAttempt | None:
+        with self.remote_operation_lock:
+            attempt = self.remote_auth_attempts.pop(remote_id, None)
+        if attempt is None:
+            return None
+        try:
+            attempt.cancellation.touch()
+        except OSError:
+            pass
+        if close_control_master:
+            self.remote_manager.close_control_master(
+                attempt.remote,
+                control_path=attempt.control_path,
+            )
+        return attempt
+
+    def cancel_all_herdr_authentication(
+        self,
+        *,
+        close_control_masters: bool = True,
+    ) -> tuple[HerdrAuthenticationAttempt, ...]:
+        with self.remote_operation_lock:
+            remote_ids = tuple(self.remote_auth_attempts)
+        attempts = tuple(
+            attempt
+            for remote_id in remote_ids
+            if (
+                attempt := self.cancel_herdr_authentication(
+                    remote_id,
+                    close_control_master=close_control_masters,
+                )
+            )
+            is not None
+        )
+        return attempts
 
     def set_session_terminal(
         self,
@@ -1525,6 +2459,11 @@ class StatusBarController(NSObject):
 
     def open_session(self, status: AgentStatus | object, action: str | None, *, remember: bool) -> None:
         if not isinstance(status, AgentStatus):
+            return
+        if status.source_kind == SOURCE_KIND_HERDR_REMOTE:
+            self.set_remote_settings_message(
+                f"{status.display_name} is running on {status.origin or 'a remote host'}."
+            )
             return
         provider = status.provider.lower()
         requested_action = (
@@ -2342,20 +3281,59 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
 
     menu.addItem_(disabled_menu_item("Agents"))
 
-    statuses = recent_statuses(snapshot, target.settings)
-    if not statuses:
-        menu.addItem_(disabled_menu_item("No recent sessions"))
-    else:
-        collision_keys = session_title_collision_keys(statuses)
-        for status in statuses:
-            menu.addItem_(
-                build_session_menu_item(
-                    status,
-                    snapshot.collected_at,
-                    target,
-                    disambiguate_title=session_title_collision_key(status) in collision_keys,
-                )
+    remotes = tuple(getattr(target.settings, "herdr_remotes", ()))
+    if remotes:
+        statuses = recent_statuses(snapshot, target.settings, limit=None)
+        local_statuses = [
+            status
+            for status in statuses
+            if status.source_kind != SOURCE_KIND_HERDR_REMOTE
+        ][:STATUS_BAR_SESSION_HISTORY_LIMIT]
+        add_agent_status_group(
+            menu,
+            "Local",
+            local_statuses,
+            snapshot.collected_at,
+            target,
+        )
+        for remote in remotes:
+            remote_statuses = [
+                status
+                for status in statuses
+                if status.source_kind == SOURCE_KIND_HERDR_REMOTE
+                and status.source_id == remote.remote_id
+            ][:STATUS_BAR_SESSION_HISTORY_LIMIT]
+            connection = None
+            remote_manager = getattr(target, "remote_manager", None)
+            if remote_manager is not None:
+                connection = remote_manager.connection_status(remote.remote_id)
+            add_agent_status_group(
+                menu,
+                f"{remote.name} via Herdr",
+                remote_statuses,
+                snapshot.collected_at,
+                target,
+                connection_label=(
+                    connection.label if connection is not None else None
+                ),
             )
+    else:
+        statuses = recent_statuses(snapshot, target.settings)
+        if not statuses:
+            menu.addItem_(disabled_menu_item("No recent sessions"))
+        else:
+            collision_keys = session_title_collision_keys(statuses)
+            for status in statuses:
+                menu.addItem_(
+                    build_session_menu_item(
+                        status,
+                        snapshot.collected_at,
+                        target,
+                        disambiguate_title=(
+                            session_title_collision_key(status) in collision_keys
+                        ),
+                    )
+                )
 
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Devices"))
@@ -2405,6 +3383,39 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     menu.addItem_(quit_item)
 
     return menu
+
+
+def add_agent_status_group(
+    menu: NSMenu,
+    title: str,
+    statuses: list[AgentStatus],
+    now: datetime,
+    target: StatusBarController,
+    *,
+    connection_label: str | None = None,
+) -> None:
+    parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+    submenu = NSMenu.alloc().init()
+    if connection_label:
+        submenu.addItem_(disabled_menu_item(connection_label))
+        submenu.addItem_(NSMenuItem.separatorItem())
+    if not statuses:
+        submenu.addItem_(disabled_menu_item("No active agents"))
+    else:
+        collision_keys = session_title_collision_keys(statuses)
+        for status in statuses:
+            submenu.addItem_(
+                build_session_menu_item(
+                    status,
+                    now,
+                    target,
+                    disambiguate_title=(
+                        session_title_collision_key(status) in collision_keys
+                    ),
+                )
+            )
+    parent.setSubmenu_(submenu)
+    menu.addItem_(parent)
 
 
 def build_sleep_prevention_policy_item(policy: str, target: StatusBarController) -> NSMenuItem:
@@ -3261,6 +4272,13 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     tab_height = height - 84
     tab_view = NSTabView.alloc().initWithFrame_(((20, 54), (tab_width, tab_height)))
     agents_tab = add_settings_tab(tab_view, "agents", "Agents", tab_width, tab_height)
+    remotes_tab = add_settings_tab(
+        tab_view,
+        "remotes",
+        "Remote Agents",
+        tab_width,
+        tab_height,
+    )
     devices_tab = add_settings_tab(
         tab_view,
         "devices",
@@ -3356,6 +4374,99 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "toggleClaudeTranscripts:",
     )
 
+    add_label(remotes_tab, "Herdr Remotes", 24, 416, 240, 24)
+    remote_selector = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+        ((32, 378), (260, 28)),
+        False,
+    )
+    remote_selector.setTarget_(target)
+    remote_selector.setAction_("selectHerdrRemote:")
+    remotes_tab.addSubview_(remote_selector)
+    add_button(
+        remotes_tab,
+        "Add",
+        312,
+        378,
+        90,
+        28,
+        target,
+        "addHerdrRemote:",
+    )
+    remote_remove = add_button(
+        remotes_tab,
+        "Remove",
+        412,
+        378,
+        90,
+        28,
+        target,
+        "removeHerdrRemote:",
+    )
+
+    add_label(remotes_tab, "Display name", 32, 332, 120, 22)
+    remote_name = add_editable_field(remotes_tab, "", 170, 330, 320, 24)
+    add_label(remotes_tab, "SSH target", 32, 292, 120, 22)
+    remote_target = add_editable_field(remotes_tab, "", 170, 290, 320, 24)
+    add_label(remotes_tab, "Herdr session", 32, 252, 120, 22)
+    remote_session = add_editable_field(remotes_tab, "", 170, 250, 320, 24)
+    add_label(remotes_tab, "Leave blank for the default session.", 170, 226, 320, 20)
+    remote_enabled = add_checkbox(
+        remotes_tab,
+        "Enabled",
+        32,
+        192,
+        120,
+        24,
+        None,
+        "",
+    )
+
+    add_separator(remotes_tab, 24, 176, tab_width - 48)
+    remote_path = add_label(remotes_tab, "", 32, 144, 580, 22)
+    remote_status = add_label(remotes_tab, "", 32, 114, 580, 22)
+    remote_last_update = add_label(remotes_tab, "", 32, 84, 580, 22)
+
+    add_button(
+        remotes_tab,
+        "Test Connection",
+        32,
+        36,
+        130,
+        28,
+        target,
+        "testHerdrRemote:",
+    )
+    add_button(
+        remotes_tab,
+        "Authenticate in Terminal",
+        172,
+        36,
+        170,
+        28,
+        target,
+        "authenticateHerdrRemote:",
+    )
+    remote_retry = add_button(
+        remotes_tab,
+        "Retry",
+        352,
+        36,
+        70,
+        28,
+        target,
+        "retryHerdrRemote:",
+    )
+    add_button(
+        remotes_tab,
+        "Save",
+        522,
+        36,
+        90,
+        28,
+        target,
+        "saveHerdrRemote:",
+    )
+
     add_label(devices_tab, "LED Display", 24, 398, 240, 24)
     battery_leds = add_checkbox(
         devices_tab,
@@ -3439,6 +4550,13 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "claude_hook_status": claude_status,
         "grok_hook_status": grok_status,
         "copilot_hook_status": copilot_status,
+        "herdr_remote_selector": remote_selector,
+        "herdr_remote_name": remote_name,
+        "herdr_remote_target": remote_target,
+        "herdr_remote_session": remote_session,
+        "herdr_remote_path": remote_path,
+        "herdr_remote_status": remote_status,
+        "herdr_remote_last_update": remote_last_update,
         "debug_log_status": debug_log_status,
         "codex_session_opener": codex_opener,
         "claude_session_opener": claude_opener,
@@ -3463,6 +4581,9 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "claude_transcripts": claude_transcripts,
         "battery_leds": battery_leds,
         "battery_power_preview": battery_power_preview,
+        "herdr_remote_enabled": remote_enabled,
+        "herdr_remote_remove": remote_remove,
+        "herdr_remote_retry": remote_retry,
     }
     return window
 
@@ -3884,6 +5005,105 @@ def hook_status_text(config: ProviderConfig) -> str:
     return "Not installed"
 
 
+def herdr_connection_state_for_error(exc: Exception) -> HerdrConnectionState:
+    if isinstance(exc, HerdrAuthenticationRequired):
+        return HerdrConnectionState.AUTHENTICATION_REQUIRED
+    if isinstance(exc, HerdrUnsupportedPlatform):
+        return HerdrConnectionState.UNSUPPORTED_PLATFORM
+    if isinstance(exc, HerdrNotInstalled):
+        return HerdrConnectionState.HERDR_NOT_INSTALLED
+    if isinstance(exc, HerdrInvalidPathOverride):
+        return HerdrConnectionState.INVALID_PATH_OVERRIDE
+    if isinstance(exc, HerdrTransportError):
+        return HerdrConnectionState.SSH_HOST_UNAVAILABLE
+    return HerdrConnectionState.INCOMPATIBLE_RESPONSE
+
+
+def herdr_authentication_command(
+    remote: HerdrRemoteSetting,
+    marker: Path,
+    acknowledgement: Path,
+    cancellation: Path,
+    control_path: Path,
+) -> str:
+    target = shell_double_quote(validate_ssh_target(remote.ssh_target))
+    quoted_control_path = shell_double_quote(str(control_path))
+    quoted_marker = shell_double_quote(str(marker))
+    quoted_acknowledgement = shell_double_quote(str(acknowledgement))
+    quoted_cancellation = shell_double_quote(str(cancellation))
+    connect_command = (
+        "ssh -fT -o BatchMode=no -o ControlMaster=auto "
+        f"-o ControlPersist={HERDR_SSH_CONTROL_PERSIST_SECONDS} "
+        f"-o ServerAliveInterval={HERDR_SSH_SERVER_ALIVE_INTERVAL_SECONDS} "
+        f"-o ServerAliveCountMax={HERDR_SSH_SERVER_ALIVE_COUNT_MAX} "
+        f"-S {quoted_control_path} -- {target} true"
+    )
+    close_command = (
+        "ssh -T -o BatchMode=yes "
+        f"-S {quoted_control_path} -O exit -- {target} "
+        "> /dev/null 2>&1 || true"
+    )
+    script = (
+        "ssh_pid=; watchdog_pid=; "
+        "cleanup() { "
+        'if [ -n "$watchdog_pid" ]; then '
+        'kill "$watchdog_pid" > /dev/null 2>&1 || true; fi; '
+        'if [ -n "$ssh_pid" ] && kill -0 "$ssh_pid" 2>/dev/null; then '
+        'kill -TERM "$ssh_pid" > /dev/null 2>&1 || true; fi; '
+        f"if [ ! -e {quoted_acknowledgement} ]; then {close_command}; fi; "
+        f"rm -f {quoted_marker} {quoted_acknowledgement} "
+        f"{quoted_cancellation}; "
+        "}; "
+        'trap cleanup EXIT; trap "exit 130" HUP INT TERM; '
+        f"if [ -e {quoted_cancellation} ]; then exit 130; fi; "
+        'if tty_path=$(tty 2>/dev/null); then '
+        f'{connect_command} < "$tty_path" > "$tty_path" 2>&1 & '
+        f"else {connect_command} & fi; "
+        "ssh_pid=$!; "
+        '(while kill -0 "$ssh_pid" 2>/dev/null; do '
+        f"if [ -e {quoted_cancellation} ]; then "
+        'kill -TERM "$ssh_pid" > /dev/null 2>&1 || true; exit 0; fi; '
+        "sleep 1; done) & "
+        "watchdog_pid=$!; "
+        'wait "$ssh_pid"; ssh_status=$?; '
+        'kill "$watchdog_pid" > /dev/null 2>&1 || true; '
+        'wait "$watchdog_pid" 2>/dev/null || true; '
+        "watchdog_pid=; ssh_pid=; "
+        'if [ "$ssh_status" -ne 0 ]; then exit "$ssh_status"; fi; '
+        f"printf ok > {quoted_marker}; "
+        "remaining=600; "
+        f"while [ ! -e {quoted_acknowledgement} ] "
+        f"&& [ ! -e {quoted_cancellation} ] "
+        '&& [ "$remaining" -gt 0 ]; do '
+        "sleep 1; remaining=$((remaining - 1)); done; "
+        f"if [ ! -e {quoted_acknowledgement} ]; then exit 130; fi"
+    )
+    return f"/bin/sh -c {shlex.quote(script)}"
+
+
+def shell_double_quote(value: str) -> str:
+    escaped = str(value)
+    for old, new in (
+        ("\\", "\\\\"),
+        ('"', '\\"'),
+        ("$", "\\$"),
+        ("`", "\\`"),
+    ):
+        escaped = escaped.replace(old, new)
+    return f'"{escaped}"'
+
+
+def terminate_remote_process(process) -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is not None:
+            return
+        process.terminate()
+    except (AttributeError, OSError, ProcessLookupError):
+        pass
+
+
 def device_id_for_root(root: Path) -> str:
     return str(root.expanduser())
 
@@ -3993,13 +5213,17 @@ def build_session_menu_item(
     width: float | None = None,
     disambiguate_title: bool = False,
 ) -> NSMenuItem:
+    remote = status.source_kind == SOURCE_KIND_HERDR_REMOTE
     item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         native_session_menu_title(status, disambiguate=disambiguate_title),
-        "openSessionPrimary:",
+        None if remote else "openSessionPrimary:",
         "",
     )
-    item.setTarget_(target)
-    item.setRepresentedObject_(status)
+    if remote:
+        item.setEnabled_(False)
+    else:
+        item.setTarget_(target)
+        item.setRepresentedObject_(status)
     image = session_row_icon_for_status(status)
     if image is not None:
         item.setImage_(image)
@@ -4025,6 +5249,14 @@ def build_session_options_menu(
     menu.addItem_(disabled_menu_item(flatten_menu_title(menu_title_for_status(status, now))))
     menu.addItem_(disabled_menu_item(session_detail_for_status(status, now)))
     menu.addItem_(NSMenuItem.separatorItem())
+
+    if status.source_kind == SOURCE_KIND_HERDR_REMOTE:
+        menu.addItem_(
+            disabled_menu_item(
+                f"Remote agent on {status.origin or 'Herdr remote'}"
+            )
+        )
+        return menu
 
     if getattr(target, "settings", None) is not None:
         selected = target.settings.session_open_action(status.provider, status.origin)
@@ -4078,7 +5310,7 @@ def session_row_icon_for_status(status: AgentStatus):
     if cache_key in _session_row_icon_cache:
         return _session_row_icon_cache[cache_key]
 
-    status_icon = status_icon_for_status(status)
+    status_icon = tinted_menu_icon(status_icon_for_status(status))
     origin_icon = session_origin_icon_for_status(status)
     if origin_icon is None:
         image = status_icon
@@ -4239,6 +5471,30 @@ def image_source_rect(image) -> tuple[tuple[float, float], tuple[float, float]]:
     return ((0.0, 0.0), (float(size.width), float(size.height)))
 
 
+def tinted_menu_icon(image):
+    if image is None:
+        return None
+
+    size = image.size()
+    rect = ((0.0, 0.0), (float(size.width), float(size.height)))
+    tinted = NSImage.alloc().initWithSize_(size)
+    try:
+        tinted.lockFocus()
+        image.drawInRect_fromRect_operation_fraction_(
+            rect,
+            image_source_rect(image),
+            NSCompositingOperationSourceOver,
+            1.0,
+        )
+        NSColor.systemGreenColor().set()
+        NSRectFillUsingOperation(rect, NSCompositingOperationSourceIn)
+    finally:
+        tinted.unlockFocus()
+    tinted.setSize_(size)
+    tinted.setTemplate_(False)
+    return tinted
+
+
 def normalized_origin_text(origin: str | None) -> str:
     return " ".join(str(origin or "").strip().lower().replace("-", " ").split())
 
@@ -4334,11 +5590,11 @@ def recent_statuses(
     snapshot,
     settings=None,
     *,
-    limit: int = STATUS_BAR_SESSION_HISTORY_LIMIT,
+    limit: int | None = STATUS_BAR_SESSION_HISTORY_LIMIT,
 ) -> list[AgentStatus]:
     statuses = coalesced_menu_statuses(menu_statuses(snapshot, settings))
     statuses.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
-    return statuses[:limit]
+    return statuses if limit is None else statuses[:limit]
 
 
 def menu_statuses(snapshot, settings=None) -> tuple[AgentStatus, ...]:
@@ -4394,7 +5650,13 @@ def coalesce_statuses_by_key(statuses, key_fn) -> list[AgentStatus]:
 def menu_session_coalesce_key(status: AgentStatus) -> tuple[str, ...] | None:
     if not status.session_id:
         return None
-    return ("session", status.provider.lower(), status.session_id)
+    return (
+        "session",
+        status.source_kind,
+        status.source_id or "",
+        status.provider.lower(),
+        status.session_id,
+    )
 
 
 def menu_status_sort_key(status: AgentStatus) -> tuple[int, int, float]:
@@ -4434,6 +5696,8 @@ def menu_origin_label(status: AgentStatus) -> str | None:
 
 def primary_session_open_action(status: AgentStatus | object) -> str | None:
     if not isinstance(status, AgentStatus):
+        return None
+    if status.source_kind == SOURCE_KIND_HERDR_REMOTE:
         return None
     return default_session_open_action(status)
 

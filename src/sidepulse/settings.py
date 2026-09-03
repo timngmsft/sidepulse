@@ -133,6 +133,31 @@ class DeviceDisplaySetting:
 
 
 @dataclass(frozen=True)
+class HerdrRemoteSetting:
+    remote_id: str
+    name: str
+    ssh_target: str
+    session: str = ""
+    enabled: bool = True
+    herdr_path_override: str | None = None
+    resolved_herdr_path: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.remote_id,
+            "name": self.name,
+            "ssh_target": self.ssh_target,
+            "session": self.session,
+            "enabled": self.enabled,
+            "herdr_path_override": self.herdr_path_override,
+            "resolved_herdr_path": self.resolved_herdr_path,
+        }
+
+    def with_resolved_path(self, path: str | None) -> "HerdrRemoteSetting":
+        return replace(self, resolved_herdr_path=path)
+
+
+@dataclass(frozen=True)
 class AgentMonitorSettings:
     codex_transcripts_enabled: bool = False
     claude_transcripts_enabled: bool = False
@@ -159,6 +184,7 @@ class AgentMonitorSettings:
     sleep_prevention_min_battery_percent: float = DEFAULT_SLEEP_PREVENTION_MIN_BATTERY_PERCENT
     history_timeframe_seconds: float = DEFAULT_HISTORY_TIMEFRAME_SECONDS
     setup_screen_completed: bool = False
+    herdr_remotes: tuple[HerdrRemoteSetting, ...] = ()
 
     def transcript_enabled(self, provider: str) -> bool:
         if provider == "codex":
@@ -458,6 +484,34 @@ class AgentMonitorSettings:
     def with_history_timeframe(self, seconds: float) -> "AgentMonitorSettings":
         return replace(self, history_timeframe_seconds=normalize_history_timeframe(seconds))
 
+    def herdr_remote(self, remote_id: str) -> HerdrRemoteSetting | None:
+        return next(
+            (remote for remote in self.herdr_remotes if remote.remote_id == remote_id),
+            None,
+        )
+
+    def with_herdr_remote(
+        self,
+        remote: HerdrRemoteSetting,
+    ) -> "AgentMonitorSettings":
+        remotes = list(self.herdr_remotes)
+        for index, existing in enumerate(remotes):
+            if existing.remote_id != remote.remote_id:
+                continue
+            remotes[index] = remote
+            break
+        else:
+            remotes.append(remote)
+        return replace(self, herdr_remotes=tuple(remotes))
+
+    def without_herdr_remote(self, remote_id: str) -> "AgentMonitorSettings":
+        remotes = tuple(
+            remote for remote in self.herdr_remotes if remote.remote_id != remote_id
+        )
+        if remotes == self.herdr_remotes:
+            return self
+        return replace(self, herdr_remotes=remotes)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "led_display": self.led_display,
@@ -493,6 +547,7 @@ class AgentMonitorSettings:
                 "timeframe_seconds": self.history_timeframe_seconds,
             },
             "setup_screen_completed": self.setup_screen_completed,
+            "herdr_remotes": [remote.to_dict() for remote in self.herdr_remotes],
         }
 
 
@@ -623,6 +678,7 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
             )
         ),
         setup_screen_completed=_bool_setting(data.get("setup_screen_completed"), False),
+        herdr_remotes=_herdr_remote_settings(data.get("herdr_remotes")),
     )
 
 
@@ -656,6 +712,46 @@ def normalize_terminal_app(value: object) -> str:
 
 def _string_setting(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _optional_string_setting(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _herdr_remote_settings(value: object) -> tuple[HerdrRemoteSetting, ...]:
+    if not isinstance(value, list):
+        return ()
+
+    remotes: list[HerdrRemoteSetting] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        remote_id = _string_setting(item.get("id")).strip()
+        ssh_target = _string_setting(item.get("ssh_target")).strip()
+        if not remote_id or remote_id in seen_ids or not ssh_target:
+            continue
+        seen_ids.add(remote_id)
+        session = _string_setting(item.get("session")).strip()
+        remotes.append(
+            HerdrRemoteSetting(
+                remote_id=remote_id,
+                name=_string_setting(item.get("name")).strip() or ssh_target,
+                ssh_target=ssh_target,
+                session="" if session == "default" else session,
+                enabled=_bool_setting(item.get("enabled"), True),
+                herdr_path_override=_optional_string_setting(
+                    item.get("herdr_path_override")
+                ),
+                resolved_herdr_path=_optional_string_setting(
+                    item.get("resolved_herdr_path")
+                ),
+            )
+        )
+    return tuple(remotes)
 
 
 def _sleep_prevention_policy(value: object, default: str = SLEEP_PREVENTION_AGENTS) -> str:

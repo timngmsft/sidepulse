@@ -1769,7 +1769,7 @@ class AgentMonitorTests(unittest.TestCase):
             if hasattr(view, "numberOfTabViewItems")
         ]
         self.assertEqual(len(tab_views), 1)
-        self.assertEqual(tab_views[0].numberOfTabViewItems(), 6)
+        self.assertEqual(tab_views[0].numberOfTabViewItems(), 7)
         self.assertIn("debug_log_status", target.settings_fields)
         self.assertIn("status_history_status", target.settings_fields)
         self.assertIn("status_history_chart", target.settings_fields)
@@ -1777,6 +1777,9 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("custom_terminal_path", target.settings_fields)
         self.assertIn("recent_session_retention_hours", target.settings_fields)
         self.assertIn("idle_timeout_minutes", target.settings_fields)
+        self.assertIn("herdr_remote_selector", target.settings_fields)
+        self.assertIn("herdr_remote_target", target.settings_fields)
+        self.assertIn("herdr_remote_status", target.settings_fields)
         self.assertIn("sleep_prevention_min_battery_percent", target.settings_fields)
         self.assertIn("status_history_timeframe", target.settings_fields)
         self.assertIn("closed_animation_program", target.settings_fields)
