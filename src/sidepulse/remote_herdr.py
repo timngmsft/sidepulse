@@ -129,13 +129,7 @@ class HerdrAgentObservation:
     foreground_cwd: str | None = None
     terminal_title: str | None = None
     terminal_title_stripped: str | None = None
-    pane_id: str | None = None
-    tab_id: str | None = None
-    workspace_id: str | None = None
     agent_session: str | None = None
-    focused: bool | None = None
-    revision: int | None = None
-    state_change_seq: int | None = None
 
     @property
     def effective_cwd(self) -> str | None:
@@ -311,24 +305,6 @@ def _string_field(
     return value
 
 
-def _bool_field(data: dict[str, object], key: str) -> bool | None:
-    value = data.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, bool):
-        raise HerdrResponseError(f"agent field {key!r} must be a boolean")
-    return value
-
-
-def _int_field(data: dict[str, object], key: str) -> int | None:
-    value = data.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise HerdrResponseError(f"agent field {key!r} must be an integer")
-    return value
-
-
 def parse_herdr_record(line: str | bytes) -> HerdrRecord:
     text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
     try:
@@ -359,7 +335,7 @@ def parse_herdr_record(line: str | bytes) -> HerdrRecord:
             assert agent is not None and state is not None and terminal_id is not None
             normalized_state = state.lower()
             if normalized_state not in HERDR_AGENT_STATES:
-                raise HerdrResponseError(f"unsupported Herdr agent state: {state}")
+                continue
             identity = (terminal_id, agent.lower())
             if identity in identities:
                 raise HerdrResponseError("duplicate Herdr agent identity")
@@ -375,13 +351,7 @@ def parse_herdr_record(line: str | bytes) -> HerdrRecord:
                     terminal_title_stripped=_string_field(
                         item, "terminal_title_stripped"
                     ),
-                    pane_id=_string_field(item, "pane_id"),
-                    tab_id=_string_field(item, "tab_id"),
-                    workspace_id=_string_field(item, "workspace_id"),
                     agent_session=_string_field(item, "agent_session"),
-                    focused=_bool_field(item, "focused"),
-                    revision=_int_field(item, "revision"),
-                    state_change_seq=_int_field(item, "state_change_seq"),
                 )
             )
         return HerdrAgentSnapshot(tuple(agents))
@@ -432,8 +402,7 @@ def build_discovery_script() -> str:
     )
     return _one_line(
         (
-            "os=$(uname -s) || exit 1;",
-            "printf 'SIDEPULSE_REMOTE_OS=%s\\n' \"$os\";",
+            build_os_probe_script(),
             "seen=''; n=0;",
             f"for p in {' '.join(candidates)}; do",
             'if [ -n "$p" ] && [ -x "$p" ]; then',
@@ -474,6 +443,18 @@ def build_poll_script(
         raise ValueError("Polling interval must be a positive integer")
     list_command = build_agent_list_script(path, session)
     executable = shlex.quote(validate_remote_path(path))
+    # The `| cat` is load-bearing; see "Keeping the remote loop honest" in
+    # remote-agent-integration-v2.md. Verified behaviour vs. a bare
+    # `herdr agent list 2>&1 || exit`:
+    #   - Herdr exits 1 on an error envelope. `cat` exits 0, so the envelope
+    #     reaches SidePulse and polling recovers in place; without it the loop
+    #     dies and the whole SSH session is torn down on a transient failure.
+    #   - `cat` keeps the `[ -x ]` guard as the only source of exit 127, which
+    #     SidePulse reads as "binary moved, re-run discovery". A bare pipeline
+    #     leaks Herdr's own 127 into that signal.
+    #   - `cat` is the process that owns the final write to SSH, so it takes
+    #     the SIGPIPE when the reader goes away even if Herdr ignores SIGPIPE.
+    #     Without it such a Herdr would leave this loop orphaned on the remote.
     return _one_line(
         (
             "while :; do",
@@ -490,13 +471,9 @@ def build_ssh_args(
     remote_command: str,
     *,
     ssh_binary: str = "ssh",
-    batch_mode: bool = True,
-    keepalive: bool = False,
     control_path: str | Path | None = None,
 ) -> list[str]:
-    args = [ssh_binary, "-T"]
-    if batch_mode:
-        args.extend(["-o", "BatchMode=yes"])
+    args = [ssh_binary, "-T", "-o", "BatchMode=yes"]
     if control_path is not None:
         args.extend(
             [
@@ -512,26 +489,17 @@ def build_ssh_args(
         [
             "-o",
             f"ConnectTimeout={HERDR_SSH_CONNECT_TIMEOUT_SECONDS}",
+            "-o",
+            f"ServerAliveInterval={HERDR_SSH_SERVER_ALIVE_INTERVAL_SECONDS}",
+            "-o",
+            f"ServerAliveCountMax={HERDR_SSH_SERVER_ALIVE_COUNT_MAX}",
         ]
     )
-    if keepalive or control_path is not None:
-        args.extend(
-            [
-                "-o",
-                f"ServerAliveInterval={HERDR_SSH_SERVER_ALIVE_INTERVAL_SECONDS}",
-                "-o",
-                f"ServerAliveCountMax={HERDR_SSH_SERVER_ALIVE_COUNT_MAX}",
-            ]
-        )
     args.extend(["--", validate_ssh_target(target), remote_command])
     return args
 
 
-def parse_probe_output(
-    output: str,
-    *,
-    require_candidates: bool,
-) -> tuple[str, tuple[str, ...]]:
+def parse_probe_output(output: str) -> tuple[str, tuple[str, ...]]:
     os_values: list[str] = []
     candidates: list[str] = []
     for line in output.splitlines():
@@ -552,8 +520,6 @@ def parse_probe_output(
         if value not in seen:
             seen.add(value)
             unique_candidates.append(value)
-    if require_candidates and not unique_candidates:
-        raise HerdrNotInstalled("Herdr is not installed in a supported location")
     return remote_os, tuple(unique_candidates)
 
 
@@ -615,7 +581,6 @@ class HerdrCommandClient:
         target: str,
         remote_command: str,
         *,
-        keepalive: bool = False,
         control_path: str | Path | None = None,
         cancel_event: threading.Event | None = None,
         process_observer: Callable[[object | None], None] | None = None,
@@ -628,9 +593,9 @@ class HerdrCommandClient:
                     target,
                     remote_command,
                     ssh_binary=self.ssh_binary,
-                    keepalive=keepalive,
                     control_path=control_path,
                 ),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -756,13 +721,7 @@ class HerdrCommandClient:
         self._raise_transport_failure(discovery)
         if discovery.stdout_truncated:
             raise HerdrIncompatibleResponse("Remote discovery output was too large")
-        try:
-            _, candidates = parse_probe_output(
-                discovery.stdout_text,
-                require_candidates=False,
-            )
-        except HerdrUnsupportedPlatform:
-            raise
+        _, candidates = parse_probe_output(discovery.stdout_text)
         if not candidates:
             raise HerdrNotInstalled("Herdr is not installed in a supported location")
 
@@ -771,16 +730,13 @@ class HerdrCommandClient:
             if candidate in attempted:
                 continue
             attempted.add(candidate)
-            try:
-                result = self._test_path(
-                    remote,
-                    candidate,
-                    control_path=effective_control_path,
-                    cancel_event=cancel_event,
-                    process_observer=process_observer,
-                )
-            except HerdrTransportError:
-                raise
+            result = self._test_path(
+                remote,
+                candidate,
+                control_path=effective_control_path,
+                cancel_event=cancel_event,
+                process_observer=process_observer,
+            )
             if result is not None:
                 return result
             failures.append(candidate)
@@ -805,10 +761,7 @@ class HerdrCommandClient:
             process_observer=process_observer,
         )
         self._raise_transport_failure(result)
-        remote_os, _ = parse_probe_output(
-            result.stdout_text,
-            require_candidates=False,
-        )
+        remote_os, _ = parse_probe_output(result.stdout_text)
         return remote_os
 
     def _test_path(
@@ -932,21 +885,19 @@ def _status_public_signature(status: AgentStatus) -> tuple[object, ...]:
         status.origin,
         status.source_kind,
         status.source_id,
-        status.pane_id,
-        status.tab_id,
-        status.workspace_id,
-        status.focused,
     )
 
 
 class HerdrStatusReducer:
     def __init__(
         self,
-        setting: HerdrRemoteSetting,
+        remote_id: str,
+        name: str,
         *,
         completed_visible_seconds: float = COMPLETED_VISIBLE_SECONDS,
     ) -> None:
-        self.setting = setting
+        self.remote_id = remote_id
+        self.name = name
         self.completed_visible_seconds = completed_visible_seconds
         self.raw_by_id: dict[str, HerdrAgentObservation] = {}
         self.statuses_by_id: dict[str, AgentStatus] = {}
@@ -955,7 +906,7 @@ class HerdrStatusReducer:
 
     def update_display_name(self, name: str) -> HerdrReduction:
         with self.lock:
-            self.setting = replace(self.setting, name=name)
+            self.name = name
             old = dict(self.statuses_by_id)
             origin = self._origin
             self.statuses_by_id = {
@@ -986,7 +937,7 @@ class HerdrStatusReducer:
             next_statuses: dict[str, AgentStatus] = {}
 
             for observation in snapshot.agents:
-                agent_id = herdr_agent_id(self.setting.remote_id, observation)
+                agent_id = herdr_agent_id(self.remote_id, observation)
                 next_raw[agent_id] = observation
                 previous_raw = self.raw_by_id.get(agent_id)
                 existing = self.statuses_by_id.get(agent_id)
@@ -1013,13 +964,8 @@ class HerdrStatusReducer:
             return self._reduction(old)
 
     @property
-    def statuses(self) -> tuple[AgentStatus, ...]:
-        with self.lock:
-            return tuple(self.statuses_by_id.values())
-
-    @property
     def _origin(self) -> str:
-        return f"{self.setting.name} via Herdr"
+        return f"{self.name} via Herdr"
 
     def _baseline_status(
         self,
@@ -1106,7 +1052,7 @@ class HerdrStatusReducer:
     ) -> AgentStatus:
         return AgentStatus(
             provider=observation.agent,
-            agent_id=herdr_agent_id(self.setting.remote_id, observation),
+            agent_id=herdr_agent_id(self.remote_id, observation),
             display_name=observation.display_title,
             mode=mode,
             updated_at=now,
@@ -1121,11 +1067,7 @@ class HerdrStatusReducer:
             message=observation.terminal_title,
             origin=self._origin,
             source_kind=SOURCE_KIND_HERDR_REMOTE,
-            source_id=self.setting.remote_id,
-            pane_id=observation.pane_id,
-            tab_id=observation.tab_id,
-            workspace_id=observation.workspace_id,
-            focused=observation.focused,
+            source_id=self.remote_id,
         )
 
     def _refresh_status(
@@ -1142,10 +1084,6 @@ class HerdrStatusReducer:
             message=observation.terminal_title,
             origin=self._origin,
             last_observed_at=now,
-            pane_id=observation.pane_id,
-            tab_id=observation.tab_id,
-            workspace_id=observation.workspace_id,
-            focused=observation.focused,
         )
 
     def _reduction(self, old: dict[str, AgentStatus]) -> HerdrReduction:
@@ -1207,7 +1145,6 @@ def _read_bounded_lines(
 
     buffer = bytearray()
     discarding = False
-    reported_oversized = False
     while True:
         chunk = _read_chunk(stream)
         if not chunk:
@@ -1218,23 +1155,17 @@ def _read_bounded_lines(
             return
         for byte in chunk:
             if byte == 10:
-                if discarding:
-                    if not reported_oversized:
-                        if not emit(_LineEvent(oversized=True)):
-                            return
-                else:
+                if not discarding:
                     if not emit(_LineEvent(line=bytes(buffer))):
                         return
                 buffer.clear()
                 discarding = False
-                reported_oversized = False
                 continue
             if discarding:
                 continue
             if len(buffer) >= max_record_bytes:
                 buffer.clear()
                 discarding = True
-                reported_oversized = True
                 if not emit(_LineEvent(oversized=True)):
                     return
                 continue
@@ -1254,7 +1185,6 @@ class HerdrRemoteWorker:
         self,
         setting: HerdrRemoteSetting,
         generation: int,
-        monitor: LiveAgentMonitor,
         *,
         command_client: HerdrCommandClient,
         control_path: Path,
@@ -1275,7 +1205,6 @@ class HerdrRemoteWorker:
     ) -> None:
         self.setting = setting
         self.generation = generation
-        self.monitor = monitor
         self.command_client = command_client
         self.control_path = control_path
         self.process_factory = process_factory
@@ -1286,7 +1215,7 @@ class HerdrRemoteWorker:
         self.on_refresh = on_refresh
         self.on_resolved_path = on_resolved_path
         self.monotonic = monotonic
-        self.reducer = HerdrStatusReducer(setting)
+        self.reducer = HerdrStatusReducer(setting.remote_id, setting.name)
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.grace_thread: threading.Thread | None = None
@@ -1364,7 +1293,6 @@ class HerdrRemoteWorker:
                         result.setting,
                         name=self.setting.name,
                     )
-                    self.reducer.setting = self.setting
                 if (
                     not self.setting.herdr_path_override
                     and self.setting.resolved_herdr_path
@@ -1390,28 +1318,24 @@ class HerdrRemoteWorker:
                     HerdrConnectionState.AUTHENTICATION_REQUIRED,
                     str(exc),
                 )
-                self._pause_with_grace()
                 return
             except HerdrUnsupportedPlatform as exc:
                 self._publish_connection(
                     HerdrConnectionState.UNSUPPORTED_PLATFORM,
                     str(exc),
                 )
-                self._pause_with_grace()
                 return
             except HerdrNotInstalled as exc:
                 self._publish_connection(
                     HerdrConnectionState.HERDR_NOT_INSTALLED,
                     str(exc),
                 )
-                self._pause_with_grace()
                 return
             except HerdrInvalidPathOverride as exc:
                 self._publish_connection(
                     HerdrConnectionState.INVALID_PATH_OVERRIDE,
                     str(exc),
                 )
-                self._pause_with_grace()
                 return
             except HerdrIncompatibleResponse as exc:
                 if (
@@ -1423,7 +1347,6 @@ class HerdrRemoteWorker:
                     self.incompatible_rediscovery_attempted = True
                     with self.grace_lock:
                         self.setting = self.setting.with_resolved_path(None)
-                        self.reducer.setting = self.setting
                     self._publish_resolved_path(
                         self.setting.remote_id,
                         None,
@@ -1433,7 +1356,6 @@ class HerdrRemoteWorker:
                     HerdrConnectionState.INCOMPATIBLE_RESPONSE,
                     str(exc),
                 )
-                self._pause_with_grace()
                 return
             except HerdrTransportError as exc:
                 if self.stop_event.is_set():
@@ -1447,7 +1369,6 @@ class HerdrRemoteWorker:
                 if replacement_control_path is None:
                     return
                 self.control_path = replacement_control_path
-                self._rearm_baseline(preserve_published=True)
                 self._publish_connection(
                     HerdrConnectionState.SSH_HOST_UNAVAILABLE,
                     str(exc),
@@ -1463,7 +1384,6 @@ class HerdrRemoteWorker:
                     HerdrConnectionState.INCOMPATIBLE_RESPONSE,
                     str(exc),
                 )
-                self._pause_with_grace()
                 return
 
     def _accept_test_result(self, result: HerdrRemoteTestResult) -> None:
@@ -1506,9 +1426,9 @@ class HerdrRemoteWorker:
                         build_poll_script(path, self.setting.session)
                     ),
                     ssh_binary=self.command_client.ssh_binary,
-                    keepalive=True,
                     control_path=self.control_path,
                 ),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -1563,7 +1483,6 @@ class HerdrRemoteWorker:
                     event = events.get(timeout=0.25)
                 except queue.Empty:
                     now = self.monotonic()
-                    self._expire_grace(now)
                     if process.poll() is not None:
                         break
                     if (
@@ -1585,13 +1504,11 @@ class HerdrRemoteWorker:
                         now,
                         "Remote Herdr response exceeded the record limit",
                     )
-                    self._expire_grace(now)
                     continue
                 if event.line is None or not event.line.strip():
                     saw_invalid = True
                     invalid_output.append(b"<blank record>\n")
                     raise_if_sustained_invalid(now)
-                    self._expire_grace(now)
                     continue
                 try:
                     record = parse_herdr_record(event.line)
@@ -1599,7 +1516,6 @@ class HerdrRemoteWorker:
                     saw_invalid = True
                     invalid_output.append(event.line + b"\n")
                     raise_if_sustained_invalid(now)
-                    self._expire_grace(now)
                     continue
 
                 last_valid_at = now
@@ -1615,7 +1531,6 @@ class HerdrRemoteWorker:
                         connection.state,
                         connection.message,
                     )
-                    self._expire_grace(now)
                     continue
 
                 observed_at = datetime.now(timezone.utc)
@@ -1652,7 +1567,6 @@ class HerdrRemoteWorker:
                 )
             with self.grace_lock:
                 self.setting = self.setting.with_resolved_path(None)
-                self.reducer.setting = self.setting
             self._publish_resolved_path(self.setting.remote_id, None)
             return
         if returncode == 255 and any(
@@ -1667,28 +1581,20 @@ class HerdrRemoteWorker:
         deadline = self.monotonic() + delay
         while not self.stop_event.is_set() and self._is_current():
             now = self.monotonic()
-            self._expire_grace(now)
             remaining = deadline - now
             if remaining <= 0:
                 return False
             self.stop_event.wait(min(0.25, remaining))
         return True
 
-    def _pause_with_grace(self) -> None:
-        while not self.stop_event.is_set() and self._is_current():
-            self._expire_grace(self.monotonic())
-            self.stop_event.wait(0.25)
-
     def _watch_grace(self) -> None:
         while not self.stop_event.is_set() and self._is_current():
             self._expire_grace(self.monotonic())
             self.stop_event.wait(0.25)
 
-    def _rearm_baseline(self, *, preserve_published: bool) -> HerdrReduction:
+    def _rearm_baseline(self, *, preserve_published: bool) -> None:
         with self.grace_lock:
-            return self.reducer.rearm_baseline(
-                preserve_published=preserve_published,
-            )
+            self.reducer.rearm_baseline(preserve_published=preserve_published)
 
     def _apply_authoritative_snapshot(
         self,
@@ -1750,8 +1656,6 @@ class HerdrRemoteWorker:
         *,
         last_success_at: datetime | None = None,
     ) -> None:
-        if not self._is_current():
-            return
         self.on_connection(
             self.generation,
             HerdrConnectionStatus(
@@ -1767,8 +1671,6 @@ class HerdrRemoteWorker:
         remote_id: str,
         path: str | None,
     ) -> None:
-        if not self._is_current():
-            return
         self.on_resolved_path(remote_id, self.generation, path)
 
     def _observe_process(self, process: object | None) -> None:
@@ -1788,7 +1690,6 @@ class HerdrRemoteManager:
         process_factory: Callable[..., object] = subprocess.Popen,
         worker_factory: Callable[..., HerdrRemoteWorker] = HerdrRemoteWorker,
         on_refresh: Callable[[], None] | None = None,
-        on_connection_change: Callable[[], None] | None = None,
         on_resolved_path: Callable[[str, int, str | None], None] | None = None,
     ) -> None:
         self.monitor = monitor
@@ -1798,7 +1699,6 @@ class HerdrRemoteManager:
         self.process_factory = process_factory
         self.worker_factory = worker_factory
         self.on_refresh = on_refresh or (lambda: None)
-        self.on_connection_change = on_connection_change or (lambda: None)
         self.on_resolved_path = on_resolved_path or (
             lambda _remote_id, _generation, _path: None
         )
@@ -1993,10 +1893,6 @@ class HerdrRemoteManager:
         with self.lock:
             return self.connections.get(remote_id)
 
-    def connection_statuses(self) -> tuple[HerdrConnectionStatus, ...]:
-        with self.lock:
-            return tuple(self.connections.values())
-
     def _start(self, setting: HerdrRemoteSetting) -> None:
         try:
             validated = validate_remote_setting(setting)
@@ -2008,7 +1904,6 @@ class HerdrRemoteManager:
                 worker = self.worker_factory(
                     validated,
                     generation,
-                    self.monitor,
                     command_client=self.command_client,
                     control_path=control_path,
                     process_factory=self.process_factory,
@@ -2075,28 +1970,24 @@ class HerdrRemoteManager:
             worker = self.workers_by_id.pop(remote_id, None)
             if remove_setting:
                 self.settings_by_id.pop(remote_id, None)
-                removed_keys = {
-                    key
-                    for key in self.control_paths_by_endpoint
-                    if key[0] == remote_id
-                }
                 self.control_paths_by_endpoint = {
                     key: path
                     for key, path in self.control_paths_by_endpoint.items()
                     if key[0] != remote_id
                 }
-                for key in removed_keys:
-                    self.control_path_nonces_by_endpoint[key] = uuid.uuid4().hex
+                self.control_path_nonces_by_endpoint = {
+                    key: nonce
+                    for key, nonce in self.control_path_nonces_by_endpoint.items()
+                    if key[0] != remote_id
+                }
             if remove_setting or clear_connection:
                 self.connections.pop(remote_id, None)
             removed = self.monitor.remove_source(
                 SOURCE_KIND_HERDR_REMOTE,
                 remote_id,
             )
-        if removed:
+        if removed or remove_setting:
             self.on_refresh()
-        if remove_setting:
-            self.on_connection_change()
 
         def cleanup() -> None:
             try:
@@ -2288,7 +2179,7 @@ class HerdrRemoteManager:
             or previous.state != connection.state
             or previous.message != connection.message
         ):
-            self.on_connection_change()
+            self.on_refresh()
 
     def _resolved_path(
         self,
@@ -2305,9 +2196,6 @@ class HerdrRemoteManager:
             updated = setting.with_resolved_path(path)
             self.settings_by_id[remote_id] = updated
         self.on_resolved_path(remote_id, generation, path)
-
-    def generation_is_current(self, remote_id: str, generation: int) -> bool:
-        return self._is_current(remote_id, generation)
 
     def resolved_path_is_current(
         self,

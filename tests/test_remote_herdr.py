@@ -42,6 +42,7 @@ from sidepulse.remote_herdr import (
     build_ssh_args,
     herdr_agent_id,
     herdr_ssh_control_path,
+    normalize_herdr_session,
     parse_herdr_record,
     parse_probe_output,
     validate_remote_path,
@@ -57,7 +58,6 @@ from sidepulse.settings import (
     AgentMonitorSettings,
     HerdrRemoteSetting,
     load_settings,
-    new_herdr_remote,
     save_settings,
 )
 
@@ -77,12 +77,6 @@ def agent_payload(
         "foreground_cwd": "/work/repo",
         "terminal_title": title,
         "terminal_title_stripped": title,
-        "pane_id": "w1:p1",
-        "tab_id": "w1:t1",
-        "workspace_id": "w1",
-        "focused": False,
-        "revision": 2,
-        "state_change_seq": 3,
     }
 
 
@@ -165,7 +159,8 @@ class RemoteSettingsTests(unittest.TestCase):
     def test_settings_round_trip_herdr_remotes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
-            remote = new_herdr_remote(
+            remote = HerdrRemoteSetting(
+                remote_id="remote-1",
                 name="Workbox",
                 ssh_target="workbox",
                 session="agents",
@@ -178,14 +173,26 @@ class RemoteSettingsTests(unittest.TestCase):
             self.assertEqual(load_settings(path), settings)
 
     def test_default_session_is_normalized(self) -> None:
-        remote = new_herdr_remote(
-            name="Workbox",
-            ssh_target="workbox",
-            session="default",
-        )
+        self.assertEqual(normalize_herdr_session("default"), "")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "herdr_remotes": [
+                            {
+                                "id": "remote-1",
+                                "name": "Workbox",
+                                "ssh_target": "workbox",
+                                "session": "default",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
 
-        self.assertEqual(remote.session, "")
-        self.assertEqual(remote.to_dict()["session"], "")
+            self.assertEqual(load_settings(path).herdr_remotes[0].session, "")
 
 
 class RemoteCommandTests(unittest.TestCase):
@@ -306,7 +313,14 @@ class RemoteCommandTests(unittest.TestCase):
         script = build_poll_script("/opt/herdr", "agents")
 
         self.assertNotIn("\n", script)
-        self.assertIn("/opt/herdr --session agents agent list 2>&1 | cat || exit", script)
+        # `| cat` must stay. It absorbs Herdr's exit 1 on an error envelope so
+        # a transient failure recovers in place instead of tearing down SSH, it
+        # keeps `[ -x ]` as the only source of exit 127, and it guarantees a
+        # SIGPIPE-sensitive final writer. See remote-agent-integration-v2.md.
+        self.assertIn(
+            "/opt/herdr --session agents agent list 2>&1 | cat || exit",
+            script,
+        )
         self.assertIn("[ -x /opt/herdr ] || exit 127", script)
 
     def test_discovery_script_reports_all_candidates(self) -> None:
@@ -325,8 +339,7 @@ class RemoteCommandTests(unittest.TestCase):
                     "SIDEPULSE_HERDR_CANDIDATE=/old/herdr",
                     "SIDEPULSE_HERDR_CANDIDATE=/good/herdr",
                 ]
-            ),
-            require_candidates=True,
+            )
         )
 
         self.assertEqual(remote_os, "Linux")
@@ -522,7 +535,10 @@ class ResponseParsingTests(unittest.TestCase):
 class ReducerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
-        self.reducer = HerdrStatusReducer(self.remote)
+        self.reducer = HerdrStatusReducer(
+            self.remote.remote_id,
+            self.remote.name,
+        )
         self.now = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
 
     def observation(self, state: str, **kwargs) -> HerdrAgentObservation:
@@ -535,12 +551,6 @@ class ReducerTests(unittest.TestCase):
             foreground_cwd=str(values["foreground_cwd"]),
             terminal_title=str(values["terminal_title"]),
             terminal_title_stripped=str(values["terminal_title_stripped"]),
-            pane_id=str(values["pane_id"]),
-            tab_id=str(values["tab_id"]),
-            workspace_id=str(values["workspace_id"]),
-            focused=bool(values["focused"]),
-            revision=int(values["revision"]),
-            state_change_seq=int(values["state_change_seq"]),
         )
 
     def test_initial_settled_state_is_suppressed(self) -> None:
@@ -654,10 +664,8 @@ class ReducerTests(unittest.TestCase):
             self.observation("working"),
             terminal_title="Renamed task",
             terminal_title_stripped="Renamed task",
-            pane_id="w2:p4",
-            tab_id="w2:t2",
-            workspace_id="w2",
-            focused=True,
+            cwd="/work/other",
+            foreground_cwd="/work/other",
         )
 
         result = self.reducer.apply(
@@ -668,17 +676,16 @@ class ReducerTests(unittest.TestCase):
         status = result.statuses[0]
         self.assertEqual(status.updated_at, initial.updated_at)
         self.assertEqual(status.display_name, "Renamed task")
-        self.assertEqual(status.pane_id, "w2:p4")
-        self.assertTrue(status.focused)
+        self.assertEqual(status.cwd, "/work/other")
         self.assertTrue(result.refresh_needed)
 
-    def test_pane_move_does_not_change_identity(self) -> None:
+    def test_identity_depends_only_on_terminal_and_agent(self) -> None:
         original = self.observation("working")
         moved = replace(
             original,
-            pane_id="w2:p8",
-            tab_id="w2:t3",
-            workspace_id="w2",
+            terminal_title="Somewhere else",
+            terminal_title_stripped="Somewhere else",
+            cwd="/work/other",
         )
 
         self.assertEqual(
@@ -816,7 +823,8 @@ class CollectorIntegrationTests(unittest.TestCase):
                 source_kind="local",
                 source_id=None,
             )
-            monitor.upsert_status(local)
+            monitor.statuses_by_key[local.agent_id] = local
+            monitor.write_latest_state()
             persisted = json.loads(latest.read_text())
             self.assertEqual(
                 [item["agent_id"] for item in persisted["statuses"]],
@@ -920,7 +928,6 @@ class FakeWorker:
         self,
         setting,
         generation,
-        _monitor,
         *,
         is_current,
         control_path,
@@ -1393,7 +1400,6 @@ class ManagerLifecycleTests(unittest.TestCase):
         worker = HerdrRemoteWorker(
             remote,
             1,
-            LiveAgentMonitor(),
             command_client=HerdrCommandClient(
                 process_factory=SequencedProcessFactory([])
             ),
@@ -1465,7 +1471,6 @@ class ManagerLifecycleTests(unittest.TestCase):
         worker = HerdrRemoteWorker(
             remote,
             1,
-            LiveAgentMonitor(),
             command_client=ProbeClient(),
             control_path=herdr_ssh_control_path(
                 remote.remote_id,
@@ -1518,7 +1523,6 @@ class ManagerLifecycleTests(unittest.TestCase):
         worker = HerdrRemoteWorker(
             remote,
             1,
-            LiveAgentMonitor(),
             command_client=client,
             control_path=herdr_ssh_control_path(
                 remote.remote_id,
@@ -1597,7 +1601,6 @@ class ManagerLifecycleTests(unittest.TestCase):
         worker = HerdrRemoteWorker(
             remote,
             1,
-            LiveAgentMonitor(),
             command_client=client,
             control_path=control_path,
             is_current=lambda _remote_id, _generation: True,
@@ -1632,7 +1635,6 @@ class ManagerLifecycleTests(unittest.TestCase):
         worker = HerdrRemoteWorker(
             remote,
             1,
-            LiveAgentMonitor(),
             command_client=HerdrCommandClient(
                 process_factory=SequencedProcessFactory([])
             ),
@@ -1685,7 +1687,6 @@ class ManagerLifecycleTests(unittest.TestCase):
                 worker = HerdrRemoteWorker(
                     remote,
                     1,
-                    LiveAgentMonitor(),
                     command_client=HerdrCommandClient(
                         process_factory=SequencedProcessFactory([])
                     ),
@@ -1728,7 +1729,7 @@ class ManagerLifecycleTests(unittest.TestCase):
                     if "SIDEPULSE_HERDR_CANDIDATE" in command:
                         print("SIDEPULSE_REMOTE_OS=Linux")
                         print("SIDEPULSE_HERDR_CANDIDATE=/fake/herdr")
-                    elif "| cat || exit" in command:
+                    elif "while :;" in command:
                         sys.stderr.write("diagnostic output\\n" * 20000)
                         sys.stderr.flush()
                         print("remote shell startup noise", flush=True)
@@ -1745,11 +1746,7 @@ class ManagerLifecycleTests(unittest.TestCase):
                                         "cwd": "/work/repo",
                                         "foreground_cwd": "/work/repo",
                                         "terminal_title": "Remote task",
-                                        "terminal_title_stripped": "Remote task",
-                                        "pane_id": "w1:p1",
-                                        "tab_id": "w1:t1",
-                                        "workspace_id": "w1",
-                                        "focused": False
+                                        "terminal_title_stripped": "Remote task"
                                     }}]
                                 }}
                             }}), flush=True)
@@ -1790,7 +1787,9 @@ class ManagerLifecycleTests(unittest.TestCase):
             snapshot = monitor.snapshot()
             self.assertTrue(observed_completed)
             self.assertEqual(snapshot.statuses, ())
-            self.assertEqual(len(refreshes), 3)
+            # Two connection transitions (connecting, connected) plus three
+            # status publications (working, completed, cleared).
+            self.assertEqual(len(refreshes), 5)
 
 
 if __name__ == "__main__":

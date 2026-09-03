@@ -155,7 +155,6 @@ from .remote_herdr import (
     HERDR_SSH_SERVER_ALIVE_INTERVAL_SECONDS,
     HerdrAuthenticationRequired,
     HerdrConnectionState,
-    HerdrIncompatibleResponse,
     HerdrInvalidPathOverride,
     HerdrNotInstalled,
     HerdrRemoteManager,
@@ -961,7 +960,6 @@ class StatusBarController(NSObject):
         return HerdrRemoteManager(
             self.monitor,
             on_refresh=self.schedule_remote_refresh,
-            on_connection_change=self.schedule_remote_refresh,
             on_resolved_path=self.handle_remote_resolved_path,
         )
 
@@ -5018,8 +5016,6 @@ def herdr_connection_state_for_error(exc: Exception) -> HerdrConnectionState:
         return HerdrConnectionState.INVALID_PATH_OVERRIDE
     if isinstance(exc, HerdrTransportError):
         return HerdrConnectionState.SSH_HOST_UNAVAILABLE
-    if isinstance(exc, HerdrIncompatibleResponse):
-        return HerdrConnectionState.INCOMPATIBLE_RESPONSE
     return HerdrConnectionState.INCOMPATIBLE_RESPONSE
 
 

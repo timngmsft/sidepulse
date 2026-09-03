@@ -424,30 +424,6 @@ class LiveAgentMonitor:
             self.statuses_by_key[status.agent_id] = status
             self.write_latest_state()
 
-    def upsert_status(self, status: AgentStatus, *, persist: bool | None = None) -> bool:
-        with self.lock:
-            previous = self.statuses_by_key.get(status.agent_id)
-            if previous == status:
-                return False
-            self.statuses_by_key[status.agent_id] = status
-            should_persist = (
-                status.source_kind == SOURCE_KIND_LOCAL
-                if persist is None
-                else persist
-            )
-            if should_persist:
-                self.write_latest_state()
-            return True
-
-    def remove_status(self, agent_id: str, *, persist: bool = True) -> bool:
-        with self.lock:
-            status = self.statuses_by_key.pop(agent_id, None)
-            if status is None:
-                return False
-            if persist and status.source_kind == SOURCE_KIND_LOCAL:
-                self.write_latest_state()
-            return True
-
     def remove_source(self, source_kind: str, source_id: str) -> bool:
         with self.lock:
             removed = [
@@ -1403,14 +1379,6 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
             ),
             source_kind=_string_or_none(data.get("source_kind")) or SOURCE_KIND_LOCAL,
             source_id=_string_or_none(data.get("source_id")),
-            pane_id=_string_or_none(data.get("pane_id")),
-            tab_id=_string_or_none(data.get("tab_id")),
-            workspace_id=_string_or_none(data.get("workspace_id")),
-            focused=(
-                data.get("focused")
-                if isinstance(data.get("focused"), bool)
-                else None
-            ),
         )
     except Exception:
         return None

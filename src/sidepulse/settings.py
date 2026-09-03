@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -148,7 +147,7 @@ class HerdrRemoteSetting:
             "id": self.remote_id,
             "name": self.name,
             "ssh_target": self.ssh_target,
-            "session": "" if self.session == "default" else self.session,
+            "session": self.session,
             "enabled": self.enabled,
             "herdr_path_override": self.herdr_path_override,
             "resolved_herdr_path": self.resolved_herdr_path,
@@ -156,26 +155,6 @@ class HerdrRemoteSetting:
 
     def with_resolved_path(self, path: str | None) -> "HerdrRemoteSetting":
         return replace(self, resolved_herdr_path=path)
-
-
-def new_herdr_remote(
-    *,
-    name: str,
-    ssh_target: str,
-    session: str = "",
-    enabled: bool = True,
-    herdr_path_override: str | None = None,
-    resolved_herdr_path: str | None = None,
-) -> HerdrRemoteSetting:
-    return HerdrRemoteSetting(
-        remote_id=str(uuid.uuid4()),
-        name=name,
-        ssh_target=ssh_target,
-        session="" if session == "default" else session,
-        enabled=enabled,
-        herdr_path_override=herdr_path_override,
-        resolved_herdr_path=resolved_herdr_path,
-    )
 
 
 @dataclass(frozen=True)

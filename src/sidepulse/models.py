@@ -85,10 +85,6 @@ class AgentStatus:
     last_observed_at: datetime | None = None
     source_kind: str = SOURCE_KIND_LOCAL
     source_id: str | None = None
-    pane_id: str | None = None
-    tab_id: str | None = None
-    workspace_id: str | None = None
-    focused: bool | None = None
 
     @property
     def priority(self) -> int:
@@ -131,14 +127,6 @@ class AgentStatus:
             result["source_kind"] = self.source_kind
         if self.source_id is not None:
             result["source_id"] = self.source_id
-        if self.pane_id is not None:
-            result["pane_id"] = self.pane_id
-        if self.tab_id is not None:
-            result["tab_id"] = self.tab_id
-        if self.workspace_id is not None:
-            result["workspace_id"] = self.workspace_id
-        if self.focused is not None:
-            result["focused"] = self.focused
         return result
 
 
