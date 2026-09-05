@@ -13,6 +13,7 @@ from typing import Callable, Sequence
 from .settings import (
     CLOSED_LID_AWAKE_AGENTS,
     CLOSED_LID_AWAKE_ALWAYS,
+    CLOSED_LID_AWAKE_LOCAL_AGENTS,
     CLOSED_LID_AWAKE_NEVER,
 )
 
@@ -72,11 +73,18 @@ class MacSleepSnapshot:
         return False
 
 
-def closed_lid_awake_should_hold(policy: str, *, agents_active: bool) -> bool:
+def closed_lid_awake_should_hold(
+    policy: str,
+    *,
+    agents_active: bool,
+    local_agents_active: bool = False,
+) -> bool:
     if policy == CLOSED_LID_AWAKE_ALWAYS:
         return True
     if policy == CLOSED_LID_AWAKE_AGENTS:
         return agents_active
+    if policy == CLOSED_LID_AWAKE_LOCAL_AGENTS:
+        return local_agents_active
     return False
 
 
@@ -374,8 +382,18 @@ class ClosedLidAwakeController:
         self.use_system_disable = enabled
         self.system_disable_attempted = False
 
-    def update(self, policy: str, *, agents_active: bool) -> bool:
-        should_hold = closed_lid_awake_should_hold(policy, agents_active=agents_active)
+    def update(
+        self,
+        policy: str,
+        *,
+        agents_active: bool,
+        local_agents_active: bool = False,
+    ) -> bool:
+        should_hold = closed_lid_awake_should_hold(
+            policy,
+            agents_active=agents_active,
+            local_agents_active=local_agents_active,
+        )
         if policy != self.last_policy:
             self.system_disable_attempted = False
         self.last_policy = policy

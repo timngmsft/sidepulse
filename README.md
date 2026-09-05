@@ -519,6 +519,7 @@ prevention policy:
 | --- | --- |
 | Never | Do not use the closed-lid sleep override. |
 | When Agents Work | Keep the Mac awake while agents are Working / Tool Running / Progressing, plus the existing five-minute Ask / Done / Error grace period. |
+| When Local Agents Work | Apply the same agent activity and grace rules, but ignore remote Herdr sessions. |
 | Always | Keep the closed-lid sleep override active while the status-bar app is running. |
 
 The status-bar app still keeps the SidePulse Pro/SidePulse Dot volume active by touching

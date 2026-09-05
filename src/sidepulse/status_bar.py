@@ -194,6 +194,7 @@ from .settings import (
     SLEEP_PREVENTION_AGENTS,
     SLEEP_PREVENTION_ALWAYS,
     SLEEP_PREVENTION_CHOICES,
+    SLEEP_PREVENTION_LOCAL_AGENTS,
     SLEEP_PREVENTION_NEVER,
     TERMINAL_APP_ALACRITTY,
     TERMINAL_APP_CUSTOM,
@@ -289,6 +290,7 @@ LID_ANIMATION_LABELS = {
 SLEEP_PREVENTION_LABELS = {
     SLEEP_PREVENTION_NEVER: "Never",
     SLEEP_PREVENTION_AGENTS: "When Agents Work",
+    SLEEP_PREVENTION_LOCAL_AGENTS: "When Local Agents Work",
     SLEEP_PREVENTION_ALWAYS: "Always",
 }
 HISTORY_TIMEFRAME_LABELS = {
@@ -346,12 +348,35 @@ def state_for_mode(mode: AgentMode) -> StatusBarState:
     return STATE_IDLE
 
 
-def awake_policy_should_hold(policy: str, *, agents_active: bool) -> bool:
+def awake_policy_should_hold(
+    policy: str,
+    *,
+    agents_active: bool,
+    local_agents_active: bool = False,
+) -> bool:
     if policy == SLEEP_PREVENTION_ALWAYS:
         return True
     if policy == SLEEP_PREVENTION_AGENTS:
         return agents_active
+    if policy == SLEEP_PREVENTION_LOCAL_AGENTS:
+        return local_agents_active
     return False
+
+
+def local_agent_mode(snapshot, fallback: AgentMode = AgentMode.IDLE_READY) -> AgentMode:
+    if snapshot is None:
+        return fallback
+    local_statuses = [
+        status
+        for status in getattr(snapshot, "statuses", ())
+        if status.source_kind != SOURCE_KIND_HERDR_REMOTE
+    ]
+    if not local_statuses:
+        return AgentMode.IDLE_READY
+    return min(
+        local_statuses,
+        key=lambda status: (status.priority, -status.updated_at.timestamp()),
+    ).mode
 
 
 def sleep_prevention_battery_safeguard(
@@ -458,6 +483,9 @@ class StatusBarController(NSObject):
         self.agent_awake_last_mode = None
         self.agent_awake_grace_until_monotonic = None
         self.agent_awake_requested = False
+        self.local_agent_awake_last_mode = None
+        self.local_agent_awake_grace_until_monotonic = None
+        self.local_agent_awake_requested = False
         self.battery_sleep_safeguard_active = False
         self.battery_sleep_safeguard_reason = ""
         self.last_lid_closed = None
@@ -540,7 +568,7 @@ class StatusBarController(NSObject):
         state = state_for_mode(snapshot.aggregate.mode)
         self.observe_connected_devices()
         self.set_status(state)
-        self.sync_keep_awake(snapshot.aggregate.mode, battery_snapshot)
+        self.sync_keep_awake(snapshot.aggregate.mode, battery_snapshot, snapshot=snapshot)
         mac_sleep_snapshot = self.read_mac_sleep_snapshot()
         self.record_status_history(
             snapshot.aggregate.mode,
@@ -3160,8 +3188,16 @@ class StatusBarController(NSObject):
         self,
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None = None,
+        *,
+        snapshot=None,
     ) -> None:
         agents_active = self.update_agent_awake_request(mode)
+        policy = self.settings.sleep_prevention_policy
+        local_agents_active = False
+        if policy == SLEEP_PREVENTION_LOCAL_AGENTS:
+            local_agents_active = self.update_local_agent_awake_request(
+                local_agent_mode(snapshot, fallback=mode)
+            )
         safeguard_active, safeguard_reason = sleep_prevention_battery_safeguard(
             battery_snapshot,
             self.settings.sleep_prevention_min_battery_percent,
@@ -3174,10 +3210,10 @@ class StatusBarController(NSObject):
             )
         self.battery_sleep_safeguard_active = safeguard_active
         self.battery_sleep_safeguard_reason = safeguard_reason
-        policy = self.settings.sleep_prevention_policy
         should_hold = awake_policy_should_hold(
             policy,
             agents_active=agents_active,
+            local_agents_active=local_agents_active,
         ) and not safeguard_active
         was_running = self.keep_awake.process_running()
         self.keep_awake.update_requested(should_hold, mode=mode)
@@ -3205,35 +3241,55 @@ class StatusBarController(NSObject):
                 log_status_bar(f"sd_keepalive error: {self.last_status_read_error}")
 
     def update_agent_awake_request(self, mode: AgentMode) -> bool:
+        return StatusBarController.update_awake_request_state(
+            self,
+            mode,
+            last_mode_attribute="agent_awake_last_mode",
+            grace_attribute="agent_awake_grace_until_monotonic",
+            requested_attribute="agent_awake_requested",
+        )
+
+    def update_local_agent_awake_request(self, mode: AgentMode) -> bool:
+        return StatusBarController.update_awake_request_state(
+            self,
+            mode,
+            last_mode_attribute="local_agent_awake_last_mode",
+            grace_attribute="local_agent_awake_grace_until_monotonic",
+            requested_attribute="local_agent_awake_requested",
+        )
+
+    def update_awake_request_state(
+        self,
+        mode: AgentMode,
+        *,
+        last_mode_attribute: str,
+        grace_attribute: str,
+        requested_attribute: str,
+    ) -> bool:
         current = time.monotonic()
+        last_mode = getattr(self, last_mode_attribute, None)
+        grace_until = getattr(self, grace_attribute, None)
         if mode in {
             AgentMode.WORKING,
             AgentMode.TOOL_RUNNING,
             AgentMode.LONG_TASK_PROGRESS,
         }:
-            self.agent_awake_grace_until_monotonic = None
+            grace_until = None
             requested = True
         elif mode in {
             AgentMode.COMPLETED,
             AgentMode.WAITING_FOR_INPUT,
             AgentMode.BLOCKED_ERROR,
         }:
-            if (
-                self.agent_awake_last_mode != mode
-                or self.agent_awake_grace_until_monotonic is None
-            ):
-                self.agent_awake_grace_until_monotonic = (
-                    current + self.keep_awake.grace_seconds
-                )
-            requested = current < self.agent_awake_grace_until_monotonic
+            if last_mode != mode or grace_until is None:
+                grace_until = current + self.keep_awake.grace_seconds
+            requested = current < grace_until
         else:
-            requested = (
-                self.agent_awake_grace_until_monotonic is not None
-                and current < self.agent_awake_grace_until_monotonic
-            )
+            requested = grace_until is not None and current < grace_until
 
-        self.agent_awake_last_mode = mode
-        self.agent_awake_requested = requested
+        setattr(self, last_mode_attribute, mode)
+        setattr(self, grace_attribute, grace_until)
+        setattr(self, requested_attribute, requested)
         return requested
 
     def sync_closed_lid_awake(self, *, agents_active: bool | None = None) -> None:
@@ -3245,6 +3301,7 @@ class StatusBarController(NSObject):
         self.closed_lid_awake.update(
             policy,
             agents_active=self.agent_awake_requested if agents_active is None else agents_active,
+            local_agents_active=getattr(self, "local_agent_awake_requested", False),
         )
         is_active = self.closed_lid_awake.active()
         if was_active != is_active:
