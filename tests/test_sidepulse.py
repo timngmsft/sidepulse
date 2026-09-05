@@ -86,7 +86,12 @@ from sidepulse.lid_sleep import (
     run_sudo_pmset_disablesleep,
     sleep_helper_sudoers_rule,
 )
-from sidepulse.models import AgentMode, AgentStatus, AggregateStatus
+from sidepulse.models import (
+    AgentMode,
+    AgentStatus,
+    AggregateStatus,
+    SOURCE_KIND_HERDR_REMOTE,
+)
 from sidepulse.origin import ProcessInfo, origin_from_processes
 from sidepulse.providers import (
     detect_copilot_config,
@@ -134,6 +139,7 @@ from sidepulse.settings import (
     LED_DISPLAY_CUSTOM,
     SLEEP_PREVENTION_AGENTS,
     SLEEP_PREVENTION_ALWAYS,
+    SLEEP_PREVENTION_LOCAL_AGENTS,
     SLEEP_PREVENTION_NEVER,
     TERMINAL_APP_ALACRITTY,
     TERMINAL_APP_CUSTOM,
@@ -1695,13 +1701,13 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertNotIn("Lid: open; agent keep-awake window active", titles)
         self.assertNotIn("Battery safeguard: standby; battery 87%, threshold 20%", titles)
         policy_index = titles.index("Closed-Lid Sleep Prevention")
-        policy_items = titled_items[policy_index + 1 : policy_index + 4]
+        policy_items = titled_items[policy_index + 1 : policy_index + 5]
 
         self.assertEqual(
             [item.title() for item in policy_items],
-            ["Never", "When Agents Work", "Always"],
+            ["Never", "When Agents Work", "When Local Agents Work", "Always"],
         )
-        self.assertEqual([item.state() for item in policy_items], [0, 1, 0])
+        self.assertEqual([item.state() for item in policy_items], [0, 1, 0, 0])
         self.assertNotIn("Keep Awake With Lid Open", titles)
         self.assertNotIn("Keep Awake With Lid Closed", titles)
         self.assertNotIn("Strong Sleep Override...", titles)
@@ -4072,6 +4078,20 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertTrue(
             closed_lid_awake_should_hold(CLOSED_LID_AWAKE_AGENTS, agents_active=True)
         )
+        self.assertFalse(
+            closed_lid_awake_should_hold(
+                SLEEP_PREVENTION_LOCAL_AGENTS,
+                agents_active=True,
+                local_agents_active=False,
+            )
+        )
+        self.assertTrue(
+            closed_lid_awake_should_hold(
+                SLEEP_PREVENTION_LOCAL_AGENTS,
+                agents_active=True,
+                local_agents_active=True,
+            )
+        )
         self.assertTrue(
             closed_lid_awake_should_hold(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
         )
@@ -4116,6 +4136,94 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertFalse(fake.keep_awake.process_running())
         self.assertFalse(fake.closed_lid_awake.process_running())
         self.assertTrue(fake.agent_awake_requested)
+
+    def test_status_bar_local_agent_policy_ignores_remote_herdr_work(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        remote_status = AgentStatus(
+            provider="codex",
+            agent_id="remote:codex",
+            display_name="Remote Codex",
+            mode=AgentMode.WORKING,
+            updated_at=now,
+            event_name="herdr",
+            source_kind=SOURCE_KIND_HERDR_REMOTE,
+            source_id="remote-1",
+        )
+        local_status = AgentStatus(
+            provider="claude",
+            agent_id="local:claude",
+            display_name="Local Claude",
+            mode=AgentMode.WORKING,
+            updated_at=now,
+            event_name="PreToolUse",
+        )
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(
+                sleep_prevention_policy=SLEEP_PREVENTION_LOCAL_AGENTS,
+            ),
+            keep_awake=KeepAwakeController(
+                process_factory=lambda *_args, **_kwargs: FakeProcess()
+            ),
+            closed_lid_awake=ClosedLidAwakeController(
+                process_factory=lambda *_args, **_kwargs: FakeProcess()
+            ),
+            last_keep_awake_error=None,
+            last_closed_lid_awake_error=None,
+            last_status_read_error=None,
+            leds_enabled=False,
+            agent_awake_last_mode=None,
+            agent_awake_grace_until_monotonic=None,
+            agent_awake_requested=False,
+            local_agent_awake_last_mode=None,
+            local_agent_awake_grace_until_monotonic=None,
+            local_agent_awake_requested=False,
+            battery_sleep_safeguard_active=False,
+            battery_sleep_safeguard_reason="",
+        )
+        fake.update_agent_awake_request = (
+            lambda mode: status_bar.StatusBarController.update_agent_awake_request(fake, mode)
+        )
+        fake.update_local_agent_awake_request = (
+            lambda mode: status_bar.StatusBarController.update_local_agent_awake_request(
+                fake, mode
+            )
+        )
+        fake.update_awake_request_state = (
+            lambda mode, **kwargs: status_bar.StatusBarController.update_awake_request_state(
+                fake, mode, **kwargs
+            )
+        )
+        fake.sync_closed_lid_awake = (
+            lambda *, agents_active=None: status_bar.StatusBarController.sync_closed_lid_awake(
+                fake,
+                agents_active=agents_active,
+            )
+        )
+
+        with patch("sidepulse.status_bar.sleep_helper_installed", return_value=False):
+            status_bar.StatusBarController.sync_keep_awake(
+                fake,
+                AgentMode.WORKING,
+                snapshot=SimpleNamespace(statuses=(remote_status,)),
+            )
+
+        self.assertFalse(fake.keep_awake.process_running())
+        self.assertFalse(fake.closed_lid_awake.process_running())
+
+        with patch("sidepulse.status_bar.sleep_helper_installed", return_value=False):
+            status_bar.StatusBarController.sync_keep_awake(
+                fake,
+                AgentMode.WORKING,
+                snapshot=SimpleNamespace(statuses=(remote_status, local_status)),
+            )
+
+        self.assertTrue(fake.keep_awake.process_running())
+        self.assertTrue(fake.closed_lid_awake.process_running())
 
     def test_status_bar_sleep_prevention_always_holds_caffeinate_while_agents_idle(self) -> None:
         try:
@@ -4757,6 +4865,16 @@ class AgentMonitorTests(unittest.TestCase):
             save_settings(completed, settings_path)
             loaded_completed = load_settings(settings_path)
             self.assertTrue(loaded_completed.setup_screen_completed)
+
+            local_agents = settings.with_sleep_prevention_policy(
+                SLEEP_PREVENTION_LOCAL_AGENTS
+            )
+            save_settings(local_agents, settings_path)
+            loaded_local_agents = load_settings(settings_path)
+            self.assertEqual(
+                loaded_local_agents.sleep_prevention_policy,
+                SLEEP_PREVENTION_LOCAL_AGENTS,
+            )
 
     def test_settings_migrate_missing_lid_fields_to_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
