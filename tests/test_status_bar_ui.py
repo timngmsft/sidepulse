@@ -714,9 +714,91 @@ class MenuBuildTests(StatusBarTestCase):
 
         self.assertIn("Local", titles)
         self.assertIn("Workbox via Herdr", titles)
+        disable_item = next(item for item in walk_menu(menu) if item.title() == "Disable")
+        self.assertEqual(disable_item.action(), "toggleHerdrRemote:")
+        self.assertEqual(disable_item.representedObject(), "remote-1")
         self.assertIn("Connected", titles)
         self.assertFalse(remote_item.isEnabled())
         self.assertIsNone(remote_item.action())
+
+    def test_disabled_remote_menu_offers_enable_action(self):
+        remote = HerdrRemoteSetting(
+            "remote-1",
+            "Workbox",
+            "workbox",
+            enabled=False,
+        )
+        original_settings = self.controller.settings
+        original_manager = self.controller.remote_manager
+        self.controller.settings = AgentMonitorSettings(herdr_remotes=(remote,))
+        self.controller.remote_manager = type(
+            "RemoteManager",
+            (),
+            {
+                "connection_status": lambda _self, _remote_id: HerdrConnectionStatus(
+                    "remote-1",
+                    HerdrConnectionState.DISABLED,
+                )
+            },
+        )()
+        self.addCleanup(setattr, self.controller, "settings", original_settings)
+        self.addCleanup(setattr, self.controller, "remote_manager", original_manager)
+
+        menu = sb.build_menu(make_snapshot(), sb.STATE_IDLE, self.controller)
+        enable_item = next(item for item in walk_menu(menu) if item.title() == "Enable")
+
+        self.assertEqual(enable_item.action(), "toggleHerdrRemote:")
+        self.assertEqual(enable_item.representedObject(), "remote-1")
+
+    def test_remote_menu_toggle_persists_and_reconfigures_manager(self):
+        remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
+        applied_settings = []
+        cancelled = []
+        messages = []
+        refreshes = []
+
+        class ToggleHarness:
+            def __init__(self):
+                self.settings = AgentMonitorSettings(herdr_remotes=(remote,))
+                self.remote_manager_started = True
+                self.remote_manager = type(
+                    "RemoteManager",
+                    (),
+                    {
+                        "apply_settings": lambda _self, settings: applied_settings.append(
+                            tuple(settings)
+                        )
+                    },
+                )()
+
+            def cancel_herdr_authentication(self, remote_id):
+                cancelled.append(remote_id)
+
+            def refresh_remote_settings_controls(self):
+                refreshes.append("controls")
+
+            def set_remote_settings_message(self, message):
+                messages.append(message)
+
+            def refresh_(self, _sender):
+                refreshes.append("menu")
+
+        harness = ToggleHarness()
+        with patch.object(sb, "save_settings") as save:
+            sb.StatusBarController.set_herdr_remote_enabled(
+                harness,
+                "remote-1",
+                False,
+            )
+
+        updated = harness.settings.herdr_remote("remote-1")
+        self.assertIsNotNone(updated)
+        self.assertFalse(updated.enabled)
+        save.assert_called_once_with(harness.settings)
+        self.assertEqual(applied_settings, [harness.settings.herdr_remotes])
+        self.assertEqual(cancelled, ["remote-1"])
+        self.assertEqual(messages, ["Workbox: remote disabled."])
+        self.assertEqual(refreshes, ["controls", "menu"])
 
     def test_local_history_cap_does_not_hide_remote_agents(self):
         remote = HerdrRemoteSetting("remote-1", "Workbox", "workbox")
