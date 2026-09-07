@@ -1849,6 +1849,40 @@ class StatusBarController(NSObject):
         self.refresh_remote_connection_labels()
 
     @objc.IBAction
+    def toggleHerdrRemote_(self, sender):
+        remote_id = sender.representedObject()
+        if not isinstance(remote_id, str):
+            return
+        remote = self.settings.herdr_remote(remote_id)
+        if remote is None:
+            return
+        self.set_herdr_remote_enabled(remote_id, not remote.enabled)
+
+    def set_herdr_remote_enabled(self, remote_id: str, enabled: bool) -> None:
+        remote = self.settings.herdr_remote(remote_id)
+        if remote is None or remote.enabled == enabled:
+            return
+        updated_remote = replace(remote, enabled=enabled)
+        try:
+            updated_settings = self.settings.with_herdr_remote(updated_remote)
+            save_settings(updated_settings)
+        except Exception as exc:
+            message = f"Could not update {remote.name}: {exc}"
+            self.set_remote_settings_message(message)
+            log_status_bar(f"remote toggle error: {message}")
+            return
+
+        self.settings = updated_settings
+        if self.remote_manager_started:
+            self.remote_manager.apply_settings(self.settings.herdr_remotes)
+        if not enabled:
+            self.cancel_herdr_authentication(remote_id)
+        self.refresh_remote_settings_controls()
+        state = "enabled" if enabled else "disabled"
+        self.set_remote_settings_message(f"{remote.name}: remote {state}.")
+        self.refresh_(None)
+
+    @objc.IBAction
     def authenticateHerdrRemote_(self, _sender):
         try:
             remote = self.herdr_remote_from_fields()
@@ -3370,6 +3404,7 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
                 remote_statuses,
                 snapshot.collected_at,
                 target,
+                remote=remote,
                 connection_label=(
                     connection.label if connection is not None else None
                 ),
@@ -3449,10 +3484,21 @@ def add_agent_status_group(
     now: datetime,
     target: StatusBarController,
     *,
+    remote: HerdrRemoteSetting | None = None,
     connection_label: str | None = None,
 ) -> None:
     parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
     submenu = NSMenu.alloc().init()
+    if remote is not None:
+        toggle = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Disable" if remote.enabled else "Enable",
+            "toggleHerdrRemote:",
+            "",
+        )
+        toggle.setTarget_(target)
+        toggle.setRepresentedObject_(remote.remote_id)
+        submenu.addItem_(toggle)
+        submenu.addItem_(NSMenuItem.separatorItem())
     if connection_label:
         submenu.addItem_(disabled_menu_item(connection_label))
         submenu.addItem_(NSMenuItem.separatorItem())
