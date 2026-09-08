@@ -47,6 +47,8 @@ try:
         NSTextView,
         NSView,
         NSWorkspace,
+        NSWorkspaceDidWakeNotification,
+        NSWorkspaceWillSleepNotification,
         NSWindow,
         NSWindowStyleMaskClosable,
         NSWindowStyleMaskMiniaturizable,
@@ -282,6 +284,7 @@ STATUS_BAR_HISTORY_CHART_RECORD_LIMIT_PADDING = 300
 STATUS_BAR_HISTORY_CHART_RECORD_LIMIT_MULTIPLIER = 3.0
 MAC_SLEEP_POLL_SECONDS = 60.0
 SYSTEM_POLL_ERROR_BACKOFF_SECONDS = 30.0
+SLEEP_LED_CLEAR_TIMEOUT_SECONDS = 2.0
 LID_ANIMATION_RESTORE_FUDGE_SECONDS = 0.15
 LID_ANIMATION_LABELS = {
     LID_ANIMATION_CLOSED: "Lid Closed",
@@ -442,6 +445,8 @@ class StatusBarController(NSObject):
         self.timer = None
         self.lid_timer = None
         self.device_timer = None
+        self.power_notification_center = None
+        self.system_sleeping = False
         self.settings_window = None
         self.setup_window = None
         self.settings_fields = {}
@@ -462,6 +467,8 @@ class StatusBarController(NSObject):
         self.device_errors = {}
         self.leds_enabled = True
         self.led_sync_in_flight = False
+        self.led_write_lock = threading.Lock()
+        self.led_sleep_generation = 0
         self.last_led_error = None
         self.last_led_display_kind = LED_DISPLAY_AGENT
         self.last_connected_device_signature = None
@@ -503,6 +510,7 @@ class StatusBarController(NSObject):
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         log_status_bar("launching status item")
         self.start_event_server()
+        self.start_power_notifications()
 
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength
@@ -543,8 +551,85 @@ class StatusBarController(NSObject):
         self.remote_manager_started = True
         self.remote_manager.apply_settings(self.settings.herdr_remotes)
 
+    def start_power_notifications(self) -> None:
+        if self.power_notification_center is not None:
+            return
+        center = NSWorkspace.sharedWorkspace().notificationCenter()
+        center.addObserver_selector_name_object_(
+            self, "systemWillSleep:", NSWorkspaceWillSleepNotification, None
+        )
+        center.addObserver_selector_name_object_(
+            self, "systemDidWake:", NSWorkspaceDidWakeNotification, None
+        )
+        self.power_notification_center = center
+
+    def stop_power_notifications(self) -> None:
+        center = self.power_notification_center
+        if center is None:
+            return
+        center.removeObserver_name_object_(self, NSWorkspaceWillSleepNotification, None)
+        center.removeObserver_name_object_(self, NSWorkspaceDidWakeNotification, None)
+        self.power_notification_center = None
+
+    @objc.IBAction
+    def systemWillSleep_(self, _notification):
+        self.system_sleeping = True
+        self.led_sleep_generation += 1
+        self.led_animation_token += 1
+        self.led_animation_until_monotonic = 0.0
+        self.virtual_status_device.hide()
+        log_status_bar("system_sleep=preparing")
+        if not self.leds_enabled:
+            return
+
+        worker = threading.Thread(
+            target=self.clear_leds_for_sleep,
+            args=(self.led_sleep_generation,),
+            daemon=True,
+        )
+        worker.start()
+        # Finish the device write before acknowledging sleep, but do not let
+        # an unresponsive SD volume hold up the system indefinitely.
+        worker.join(timeout=SLEEP_LED_CLEAR_TIMEOUT_SECONDS)
+        if worker.is_alive():
+            log_status_bar("sleep LED clear timed out; allowing system sleep")
+
+    def clear_leds_for_sleep(self, generation: int) -> None:
+        with self.led_write_lock:
+            if not self.system_sleeping or generation != self.led_sleep_generation:
+                return
+            for device in self.status_bar_devices(remember=False):
+                if not self.system_sleeping or generation != self.led_sleep_generation:
+                    return
+                if (
+                    not device.connected
+                    or device.device_id == VIRTUAL_DEVICE_ID
+                    or device.display == LED_DISPLAY_CUSTOM
+                ):
+                    continue
+                try:
+                    target = write_led_program("off", device_path=device.target)
+                except (DeviceWriteError, OSError) as exc:
+                    log_status_bar(f"sleep LED clear error {device.name}: {exc}")
+                else:
+                    log_status_bar(f"sleep LEDs off device={device.name} target={target}")
+
+    @objc.IBAction
+    def systemDidWake_(self, _notification):
+        self.system_sleeping = False
+        self.led_sleep_generation += 1
+        self.led_sync_in_flight = False
+        self.led_animation_token += 1
+        self.led_animation_until_monotonic = 0.0
+        self.reset_led_controllers_for_display_change()
+        self.last_mac_sleep_poll_monotonic = 0.0
+        log_status_bar("system_sleep=awake")
+        self.refresh_(None)
+
     @objc.IBAction
     def refresh_(self, _sender):
+        if self.system_sleeping:
+            return
         try:
             snapshot = self.monitor.snapshot(include_stale=False)
         except Exception as exc:
@@ -875,6 +960,7 @@ class StatusBarController(NSObject):
 
         self.termination_cleanup_started = True
         self.remote_manager_started = False
+        self.stop_power_notifications()
         self.stop_event_server()
         self.closed_lid_awake.release()
         self.keep_awake.release()
@@ -948,6 +1034,7 @@ class StatusBarController(NSObject):
         NSApp.replyToApplicationShouldTerminate_(True)
 
     def applicationWillTerminate_(self, _notification):
+        self.stop_power_notifications()
         self.stop_event_server()
         self.remote_manager_started = False
         if not self.termination_cleanup_started:
@@ -2870,7 +2957,7 @@ class StatusBarController(NSObject):
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
     ) -> None:
-        if not self.leds_enabled:
+        if self.system_sleeping or not self.leds_enabled:
             return
 
         self.sync_virtual_status_device(mode, battery_snapshot)
@@ -2883,7 +2970,7 @@ class StatusBarController(NSObject):
         self.led_sync_in_flight = True
         thread = threading.Thread(
             target=self.sync_leds_worker,
-            args=(mode, battery_snapshot, display_kind),
+            args=(mode, battery_snapshot, display_kind, self.led_sleep_generation),
             daemon=True,
         )
         thread.start()
@@ -2933,11 +3020,16 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        generation: int,
     ) -> None:
         try:
-            self.sync_leds_now(mode, battery_snapshot, display_kind)
+            with self.led_write_lock:
+                if self.system_sleeping or generation != self.led_sleep_generation:
+                    return
+                self.sync_leds_now(mode, battery_snapshot, display_kind)
         finally:
-            self.led_sync_in_flight = False
+            if generation == self.led_sleep_generation:
+                self.led_sync_in_flight = False
 
     def sync_leds_now(
         self,
@@ -3005,7 +3097,7 @@ class StatusBarController(NSObject):
         *,
         animation: LedAnimationSetting | None = None,
     ) -> None:
-        if not self.leds_enabled:
+        if self.system_sleeping or not self.leds_enabled:
             return
         animation = animation or self.settings.lid_animation(kind)
         try:
@@ -3044,13 +3136,16 @@ class StatusBarController(NSObject):
         token: int,
     ) -> None:
         label = LID_ANIMATION_LABELS[kind]
-        for device in devices:
-            try:
-                program = program_for_lid_animation(animation, brightness=device.brightness)
-                target = write_led_program(program, device_path=device.target)
-                log_status_bar(f"animation={label} device={device.name} target={target}")
-            except Exception as exc:
-                log_status_bar(f"animation error {label} {device.name}: {exc}")
+        with self.led_write_lock:
+            for device in devices:
+                if self.system_sleeping or token != self.led_animation_token:
+                    return
+                try:
+                    program = program_for_lid_animation(animation, brightness=device.brightness)
+                    target = write_led_program(program, device_path=device.target)
+                    log_status_bar(f"animation={label} device={device.name} target={target}")
+                except (DeviceWriteError, OSError, ValueError) as exc:
+                    log_status_bar(f"animation error {label} {device.name}: {exc}")
 
         time.sleep(animation.duration_seconds + LID_ANIMATION_RESTORE_FUDGE_SECONDS)
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
@@ -3157,7 +3252,7 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def pollLid_(self, _sender):
-        if self.lid_poll_in_flight:
+        if self.system_sleeping or self.lid_poll_in_flight:
             return
         if time.monotonic() < self.lid_poll_backoff_until_monotonic:
             return

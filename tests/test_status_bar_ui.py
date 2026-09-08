@@ -28,7 +28,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 if os.uname().sysname != "Darwin":  # pragma: no cover
     raise unittest.SkipTest("status-bar UI tests require macOS")
@@ -570,6 +570,257 @@ class ApplicationLifecycleTests(StatusBarTestCase):
             "Could not remove remote: read-only settings",
         )
         self.assertTrue(remove_harness.refreshed)
+
+
+class SystemSleepTests(StatusBarTestCase):
+    def setUp(self):
+        self.controller = sb.StatusBarController.alloc().init()
+        self.addCleanup(self.controller.stop_power_notifications)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.device = replace(
+            make_device(),
+            root=root,
+            target=root / "LEDS.LED",
+        )
+        self.controller.status_bar_devices = Mock(return_value=[self.device])
+
+    def test_sleep_clears_done_and_suppresses_refreshes(self):
+        self.controller.sync_leds_now(
+            AgentMode.COMPLETED, None, sb.LED_DISPLAY_AGENT
+        )
+        self.assertNotEqual(self.device.target.read_text(), "off")
+
+        self.controller.systemWillSleep_(None)
+
+        self.assertTrue(self.controller.system_sleeping)
+        self.assertEqual(self.device.target.read_text(), "off")
+        with (
+            patch.object(self.controller.monitor, "snapshot") as snapshot,
+            patch.object(sb.threading, "Thread") as thread_type,
+        ):
+            self.controller.refresh_(None)
+            self.controller.sync_leds(
+                AgentMode.WORKING, None, sb.LED_DISPLAY_AGENT
+            )
+            self.controller.play_lid_animation(sb.LID_ANIMATION_CLOSED)
+            self.controller.pollLid_(None)
+
+        snapshot.assert_not_called()
+        thread_type.assert_not_called()
+        self.assertEqual(self.device.target.read_text(), "off")
+
+    def test_sleep_only_clears_connected_managed_physical_devices(self):
+        devices = [self.device]
+        for name, display, connected in (
+            ("battery", sb.LED_DISPLAY_BATTERY, True),
+            ("manual", sb.LED_DISPLAY_CUSTOM, True),
+            ("disconnected", sb.LED_DISPLAY_AGENT, False),
+            ("virtual", sb.LED_DISPLAY_AGENT, True),
+        ):
+            root = self.device.root / name
+            devices.append(
+                replace(
+                    self.device,
+                    device_id=sb.VIRTUAL_DEVICE_ID if name == "virtual" else name,
+                    name=name,
+                    root=root,
+                    target=root / "LEDS.LED",
+                    display=display,
+                    connected=connected,
+                )
+            )
+        for device in devices:
+            device.root.mkdir(parents=True, exist_ok=True)
+            device.target.write_text("#00FF66")
+        self.controller.status_bar_devices.return_value = devices
+        original_settings = self.controller.settings
+
+        self.controller.systemWillSleep_(None)
+
+        for device in devices[:2]:
+            self.assertEqual(device.target.read_text(), "off")
+        for device in devices[2:]:
+            self.assertEqual(device.target.read_text(), "#00FF66")
+        self.assertIs(self.controller.settings, original_settings)
+
+    def test_sleep_does_not_touch_disabled_leds(self):
+        self.controller.leds_enabled = False
+        self.device.target.write_text("#00FF66")
+        with patch.object(sb.threading, "Thread") as thread_type:
+            self.controller.systemWillSleep_(None)
+
+        thread_type.assert_not_called()
+        self.assertEqual(self.device.target.read_text(), "#00FF66")
+
+    def test_sleep_invalidates_queued_status_and_animation_writes(self):
+        with patch.object(sb.threading, "Thread") as thread_type:
+            self.controller.sync_leds(
+                AgentMode.COMPLETED, None, sb.LED_DISPLAY_AGENT
+            )
+            self.controller.play_lid_animation(sb.LID_ANIMATION_CLOSED)
+        queued = [call.kwargs for call in thread_type.call_args_list]
+        self.assertEqual(len(queued), 2)
+        animation_token = self.controller.led_animation_token
+
+        self.controller.systemWillSleep_(None)
+        sleep_generation = self.controller.led_sleep_generation
+        for job in queued:
+            job["target"](*job["args"])
+        self.controller.restoreLedDisplay_(str(animation_token))
+        self.assertEqual(self.device.target.read_text(), "off")
+
+        self.controller.refresh_ = Mock()
+        self.controller.systemDidWake_(None)
+        self.device.target.write_text("new live display")
+        self.controller.led_sync_in_flight = True
+        for job in queued:
+            job["target"](*job["args"])
+        self.controller.clear_leds_for_sleep(sleep_generation)
+        self.controller.restoreLedDisplay_(str(animation_token))
+
+        self.assertEqual(self.device.target.read_text(), "new live display")
+        self.assertTrue(self.controller.led_sync_in_flight)
+
+    def test_sleep_clear_waits_for_in_flight_status_write(self):
+        entered = threading.Event()
+        finish_write = threading.Event()
+        sync_now = self.controller.sync_leds_now
+        clear_for_sleep = self.controller.clear_leds_for_sleep
+
+        def blocked_write(*args):
+            entered.set()
+            if not finish_write.wait(timeout=2):
+                raise TimeoutError("test status write was not released")
+            sync_now(*args)
+
+        def clear_after_writer(generation):
+            finish_write.set()
+            clear_for_sleep(generation)
+
+        self.controller.sync_leds_now = blocked_write
+        self.controller.clear_leds_for_sleep = clear_after_writer
+        writer = threading.Thread(
+            target=self.controller.sync_leds_worker,
+            args=(
+                AgentMode.COMPLETED,
+                None,
+                sb.LED_DISPLAY_AGENT,
+                self.controller.led_sleep_generation,
+            ),
+            daemon=True,
+        )
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(timeout=1))
+            self.controller.systemWillSleep_(None)
+        finally:
+            finish_write.set()
+            writer.join(timeout=2)
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(self.device.target.read_text(), "off")
+
+    def test_wake_refreshes_live_status_and_invalidates_led_cache(self):
+        for mode in (AgentMode.IDLE_READY, AgentMode.COMPLETED):
+            with self.subTest(mode=mode):
+                self.controller.sync_leds_now(
+                    AgentMode.COMPLETED, None, sb.LED_DISPLAY_AGENT
+                )
+                self.controller.last_snapshot = make_snapshot(
+                    statuses=[make_status(mode=AgentMode.COMPLETED)]
+                )
+                self.controller.systemWillSleep_(None)
+                self.assertEqual(self.device.target.read_text(), "off")
+                fresh = make_snapshot(
+                    statuses=[] if mode == AgentMode.IDLE_READY else [
+                        make_status(mode=mode)
+                    ]
+                )
+                self.controller.monitor.snapshot = Mock(return_value=fresh)
+                self.controller.read_battery_snapshot = Mock(return_value=None)
+                self.controller.read_mac_sleep_snapshot = Mock(return_value=None)
+                self.controller.record_status_history = Mock()
+                self.controller.sync_keep_awake = Mock()
+                self.controller.observe_connected_devices = Mock(return_value=False)
+                self.controller.set_status = Mock()
+                self.controller.status_item = Mock()
+
+                with patch.object(sb.threading, "Thread") as thread_type:
+                    self.controller.systemDidWake_(None)
+                job = thread_type.call_args.kwargs
+                job["target"](*job["args"])
+
+                self.assertFalse(self.controller.system_sleeping)
+                self.assertIs(self.controller.last_snapshot, fresh)
+                self.controller.monitor.snapshot.assert_called_once_with(
+                    include_stale=False
+                )
+                self.assertEqual(
+                    self.device.target.read_text(),
+                    sb.program_for_display_state(sb.display_state_for_mode(mode)),
+                )
+
+    def test_sleep_clear_timeout_is_bounded_and_reported(self):
+        with (
+            patch.object(sb.threading, "Thread") as thread_type,
+            patch.object(sb, "log_status_bar") as log_status,
+        ):
+            thread_type.return_value.is_alive.return_value = True
+            self.controller.systemWillSleep_(None)
+
+        thread_type.return_value.join.assert_called_once_with(
+            timeout=sb.SLEEP_LED_CLEAR_TIMEOUT_SECONDS
+        )
+        log_status.assert_any_call(
+            "sleep LED clear timed out; allowing system sleep"
+        )
+        self.assertTrue(self.controller.system_sleeping)
+
+    def test_sleep_clear_reports_device_write_failure(self):
+        with (
+            patch.object(sb, "write_led_program", side_effect=OSError("disconnected")),
+            patch.object(sb, "log_status_bar") as log_status,
+        ):
+            self.controller.systemWillSleep_(None)
+
+        log_status.assert_any_call(
+            f"sleep LED clear error {self.device.name}: disconnected"
+        )
+        self.assertTrue(self.controller.system_sleeping)
+
+    def test_workspace_sleep_observers_are_registered_and_removed(self):
+        self.controller.leds_enabled = False
+        self.controller.refresh_ = Mock()
+        self.controller.start_power_notifications()
+        self.controller.start_power_notifications()
+        center = sb.NSWorkspace.sharedWorkspace().notificationCenter()
+
+        center.postNotificationName_object_(sb.NSWorkspaceWillSleepNotification, None)
+        self.assertTrue(self.controller.system_sleeping)
+        center.postNotificationName_object_(sb.NSWorkspaceDidWakeNotification, None)
+        self.assertFalse(self.controller.system_sleeping)
+        self.assertEqual(self.controller.led_sleep_generation, 2)
+        self.controller.refresh_.assert_called_once_with(None)
+
+        self.controller.stop_power_notifications()
+        center.postNotificationName_object_(sb.NSWorkspaceWillSleepNotification, None)
+        self.assertFalse(self.controller.system_sleeping)
+
+    def test_lid_close_without_system_sleep_preserves_live_display(self):
+        self.device.target.write_text("#00FF66")
+        self.controller.last_lid_closed = False
+        self.controller.pending_lid_closed = True
+        with patch.object(sb.threading, "Thread") as thread_type:
+            self.controller.handleLidPollResult_(None)
+
+        self.assertFalse(self.controller.system_sleeping)
+        self.assertEqual(self.device.target.read_text(), "#00FF66")
+        self.assertEqual(
+            thread_type.call_args.kwargs["args"][0], sb.LID_ANIMATION_CLOSED
+        )
+        thread_type.return_value.start.assert_called_once_with()
 
 
 class MenuBuildTests(StatusBarTestCase):

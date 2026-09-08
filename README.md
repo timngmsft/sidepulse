@@ -522,6 +522,12 @@ prevention policy:
 | When Local Agents Work | Apply the same agent activity and grace rules, but ignore remote Herdr sessions. |
 | Always | Keep the closed-lid sleep override active while the status-bar app is running. |
 
+When macOS actually goes to sleep, SidePulse turns off connected devices in
+agent or battery mode so their last status does not remain lit while the app
+is suspended. On wake, it refreshes the current status and restores the display.
+Manual device programs are left untouched. Closing the lid while the selected
+policy keeps the Mac awake still shows live status normally.
+
 The status-bar app still keeps the SidePulse Pro/SidePulse Dot volume active by touching
 a `keepalive` file on each connected device at least once per minute. The
 closed-lid policy uses the SidePulse sleep helper when it is installed. The PKG
