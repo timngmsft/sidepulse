@@ -475,6 +475,13 @@ The status-bar item shows one of four collapsed states:
 | Done | The most recent active agent completed successfully. |
 | Ask | An agent needs input, permission, or attention. |
 
+Working shows a four-segment cyan LED chase. On completion, all four segments
+turn green and brighten once, then remain steady beside Done. Ask shows four
+red-orange LEDs breathing together on a 1.6-second cycle, staying faintly lit
+between pulses until the attention state clears. The status item keeps a fixed
+width so neighboring menu-bar items do not shift between states. With macOS
+Reduce Motion enabled, Working, Ask, and Done all use steady LEDs.
+
 Click the status-bar item to expand the recent session list. Click a session
 row to open that agent using the remembered choice for that provider. Use the
 session's Open Options row to choose and remember another opener, such as the

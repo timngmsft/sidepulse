@@ -1276,6 +1276,315 @@ class IconTests(StatusBarTestCase):
             self.assertGreater(color.greenComponent(), color.blueComponent())
 
 
+class StatusLedAnimationTests(StatusBarTestCase):
+    def setUp(self):
+        self.controller = sb.StatusBarController.alloc().init()
+        self.controller.status_reduce_motion = False
+        self.button = sb.NSButton.alloc().initWithFrame_(((0, 0), (105, 22)))
+        self.controller.status_item = Mock()
+        self.controller.status_item.button.return_value = self.button
+        self.addCleanup(self.controller.stop_status_display)
+        clock = patch.object(sb.time, "monotonic", return_value=1000.0)
+        self.clock = clock.start()
+        self.addCleanup(clock.stop)
+
+    def test_chase_moves_left_to_right_and_repeats(self):
+        for index in range(sb.STATUS_LED_COUNT):
+            frame = index * sb.STATUS_LED_CHASE_FRAMES // sb.STATUS_LED_COUNT
+            levels = sb.status_led_brightness(sb.STATE_WORKING, frame)
+            self.assertEqual(len(levels), 4)
+            self.assertEqual(levels.index(max(levels)), index)
+            self.assertTrue(all(0.0 < level <= 1.0 for level in levels))
+        self.assertEqual(
+            sb.status_led_brightness(sb.STATE_WORKING, 0),
+            sb.status_led_brightness(sb.STATE_WORKING, sb.STATUS_LED_CHASE_FRAMES),
+        )
+
+    def test_done_brightens_once_then_remains_steady(self):
+        initial = sb.status_led_brightness(sb.STATE_DONE, 0)
+        peak = sb.status_led_brightness(sb.STATE_DONE, sb.STATUS_LED_DONE_FRAMES // 2)
+        settled = sb.status_led_brightness(sb.STATE_DONE, sb.STATUS_LED_DONE_FRAMES)
+        self.assertEqual(len(set(peak)), 1)
+        self.assertGreater(peak[0], initial[0])
+        self.assertEqual(initial, settled)
+        self.assertEqual(
+            settled,
+            sb.status_led_brightness(sb.STATE_DONE, sb.STATUS_LED_DONE_FRAMES * 10),
+        )
+
+    def test_ask_breathes_in_unison_without_going_dark(self):
+        initial = sb.status_led_brightness(sb.STATE_ASK, 0)
+        peak = sb.status_led_brightness(sb.STATE_ASK, sb.STATUS_LED_ASK_FRAMES // 2)
+        self.assertGreater(peak[0], initial[0])
+        self.assertAlmostEqual(peak[0], 1.0)
+        for frame in range(sb.STATUS_LED_ASK_FRAMES):
+            levels = sb.status_led_brightness(sb.STATE_ASK, frame)
+            self.assertEqual(len(levels), 4)
+            self.assertEqual(len(set(levels)), 1)
+            self.assertGreaterEqual(levels[0], 0.35)
+            self.assertLessEqual(levels[0], 1.0)
+            self.assertEqual(
+                levels,
+                sb.status_led_brightness(sb.STATE_ASK, frame + sb.STATUS_LED_ASK_FRAMES),
+            )
+
+    def test_led_images_render_four_colored_segments_at_a_fixed_size(self):
+        for state in (sb.STATE_WORKING, sb.STATE_DONE, sb.STATE_ASK):
+            with self.subTest(state=state.label):
+                image = sb.status_led_image(state, 0)
+                self.assertIs(image, sb.status_led_image(state, 0))
+                self.assertEqual(tuple(image.size()), sb.STATUS_LED_IMAGE_SIZE)
+                self.assertFalse(image.isTemplate())
+                self.assertEqual(image.accessibilityDescription(), state.label)
+                bitmap = NSBitmapImageRep.imageRepWithData_(image.TIFFRepresentation())
+                scale_x = bitmap.pixelsWide() / image.size().width
+                scale_y = bitmap.pixelsHigh() / image.size().height
+                for index in range(sb.STATUS_LED_COUNT):
+                    color = bitmap.colorAtX_y_(
+                        int((4 + index * 7) * scale_x), int(9 * scale_y)
+                    )
+                    self.assertGreater(color.alphaComponent(), 0.9)
+                    if state == sb.STATE_ASK:
+                        self.assertGreater(color.redComponent(), color.greenComponent())
+                        self.assertGreater(color.greenComponent(), color.blueComponent())
+                    else:
+                        self.assertGreater(color.greenComponent(), color.redComponent())
+                        if state == sb.STATE_WORKING:
+                            self.assertGreater(color.blueComponent(), color.greenComponent())
+                        else:
+                            self.assertGreater(color.greenComponent(), color.blueComponent())
+                for x in (7.5, 14.5, 21.5):
+                    color = bitmap.colorAtX_y_(int(x * scale_x), int(9 * scale_y))
+                    self.assertLess(color.alphaComponent(), 0.15)
+
+    def test_working_refresh_preserves_the_timer_and_animation_phase(self):
+        self.controller.set_status(sb.STATE_WORKING)
+        timer = self.controller.status_animation_timer
+        started = self.controller.status_animation_started_at
+        self.assertTrue(timer.isValid())
+        self.assertEqual(self.button.title(), " Working")
+        self.assertEqual(
+            self.button.accessibilityLabel(), "SidePulse Agent Monitor: Working"
+        )
+        self.assertEqual(self.button.toolTip(), "SidePulse Agent Monitor: Working")
+        self.clock.return_value += 9 * sb.STATUS_LED_FRAME_INTERVAL + 0.001
+        with patch.object(self.controller.monitor, "snapshot") as snapshot:
+            self.controller.animateStatus_(timer)
+        snapshot.assert_not_called()
+        self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_WORKING, 9))
+
+        self.controller.set_status(sb.STATE_WORKING)
+
+        self.assertIs(self.controller.status_animation_timer, timer)
+        self.assertEqual(self.controller.status_animation_started_at, started)
+        self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_WORKING, 9))
+
+    def test_ask_repeats_every_1_6_seconds_without_resetting_on_refresh(self):
+        self.controller.set_status(sb.STATE_ASK)
+        timer = self.controller.status_animation_timer
+        started = self.controller.status_animation_started_at
+        self.assertTrue(timer.isValid())
+        self.assertEqual(self.button.title(), " Ask")
+        self.assertEqual(self.button.accessibilityLabel(), "SidePulse Agent Monitor: Ask")
+        self.assertEqual(self.button.toolTip(), "SidePulse Agent Monitor: Ask")
+        self.clock.return_value = started + 0.8001
+        with patch.object(self.controller.monitor, "snapshot") as snapshot:
+            self.controller.animateStatus_(timer)
+        snapshot.assert_not_called()
+        self.assertIs(
+            self.button.image(),
+            sb.status_led_image(sb.STATE_ASK, sb.STATUS_LED_ASK_FRAMES // 2),
+        )
+        self.controller.set_status(sb.STATE_ASK)
+        self.assertIs(self.controller.status_animation_timer, timer)
+        self.assertEqual(self.controller.status_animation_started_at, started)
+
+        for cycles in (1, 2, 10):
+            self.clock.return_value = started + cycles * 1.6 + 0.0001
+            self.controller.animateStatus_(timer)
+            self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_ASK, 0))
+            self.assertTrue(timer.isValid())
+            self.assertEqual(self.button.title(), " Ask")
+
+    def test_waiting_and_blocked_modes_use_the_ask_pulse(self):
+        for mode in (AgentMode.WAITING_FOR_INPUT, AgentMode.BLOCKED_ERROR):
+            self.controller.set_status(sb.state_for_mode(mode))
+            self.assertTrue(self.controller.status_animation_timer.isValid())
+            self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_ASK, 0))
+
+    def test_ask_clears_immediately_when_work_resumes_or_completes(self):
+        for state in (sb.STATE_WORKING, sb.STATE_DONE):
+            self.controller.set_status(sb.STATE_ASK)
+            timer = self.controller.status_animation_timer
+            self.controller.set_status(state)
+            self.controller.animateStatus_(timer)
+            self.assertFalse(timer.isValid())
+            self.assertTrue(self.controller.status_animation_timer.isValid())
+            self.assertIs(self.button.image(), sb.status_led_image(state, 0))
+            self.assertEqual(self.button.title(), f" {state.label}")
+
+    def test_done_stops_after_one_pulse_and_does_not_replay_on_refresh(self):
+        self.controller.set_status(sb.STATE_WORKING)
+        working_timer = self.controller.status_animation_timer
+        self.controller.set_status(sb.STATE_DONE)
+        done_timer = self.controller.status_animation_timer
+        self.assertFalse(working_timer.isValid())
+        self.assertTrue(done_timer.isValid())
+        self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_DONE, 0))
+        self.clock.return_value += 9 * sb.STATUS_LED_FRAME_INTERVAL + 0.001
+        self.controller.animateStatus_(done_timer)
+        self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_DONE, 9))
+
+        self.clock.return_value += 1.0
+        self.controller.animateStatus_(done_timer)
+        self.assertFalse(done_timer.isValid())
+        self.assertIsNone(self.controller.status_animation_timer)
+        self.assertIsNone(self.controller.status_animation_started_at)
+        self.controller.set_status(sb.STATE_DONE)
+        self.assertIsNone(self.controller.status_animation_timer)
+        self.assertIs(
+            self.button.image(), sb.status_led_image(sb.STATE_DONE, sb.STATUS_LED_DONE_FRAMES)
+        )
+        self.assertEqual(self.button.title(), " Done")
+
+        self.controller.set_status(sb.STATE_WORKING)
+        self.controller.set_status(sb.STATE_DONE)
+        self.assertTrue(self.controller.status_animation_timer.isValid())
+
+    def test_idle_interrupts_animation_and_keeps_its_symbol(self):
+        for state in (sb.STATE_WORKING, sb.STATE_ASK, sb.STATE_DONE):
+            self.controller.set_status(state)
+            timer = self.controller.status_animation_timer
+            self.controller.set_status(sb.STATE_IDLE)
+            self.controller.animateStatus_(timer)
+            self.assertFalse(timer.isValid())
+            self.assertIsNone(self.controller.status_animation_timer)
+            self.assertIs(
+                self.button.image(), sb.image_for_symbol(sb.STATE_IDLE.symbol, sb.STATE_IDLE.label)
+            )
+            self.assertEqual(self.button.title(), " Idle")
+
+    def test_reduce_motion_uses_steady_leds_without_a_timer(self):
+        self.controller.status_reduce_motion = True
+        for state, frame in (
+            (sb.STATE_WORKING, -1),
+            (sb.STATE_ASK, -1),
+            (sb.STATE_DONE, sb.STATUS_LED_DONE_FRAMES),
+        ):
+            self.controller.set_status(state)
+            self.assertIsNone(self.controller.status_animation_timer)
+            self.assertIs(self.button.image(), sb.status_led_image(state, frame))
+            self.assertEqual(len(set(sb.status_led_brightness(state, frame))), 1)
+
+    def test_reduce_motion_toggle_stops_and_resumes_ask(self):
+        self.controller.set_status(sb.STATE_ASK)
+        timer = self.controller.status_animation_timer
+        with patch.object(sb, "NSWorkspace") as workspace_type:
+            workspace = workspace_type.sharedWorkspace.return_value
+            workspace.accessibilityDisplayShouldReduceMotion.return_value = True
+            self.controller.statusDisplayOptionsChanged_(None)
+            self.assertFalse(timer.isValid())
+            self.assertIsNone(self.controller.status_animation_timer)
+            self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_ASK, -1))
+
+            workspace.accessibilityDisplayShouldReduceMotion.return_value = False
+            self.controller.statusDisplayOptionsChanged_(None)
+            self.assertTrue(self.controller.status_animation_timer.isValid())
+            self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_ASK, 0))
+
+    def test_display_notifications_apply_immediately_without_replaying_done(self):
+        center = sb.NSWorkspace.sharedWorkspace().notificationCenter()
+        notification = sb.NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification
+        with patch.object(sb, "NSWorkspace") as workspace_type:
+            workspace = workspace_type.sharedWorkspace.return_value
+            workspace.notificationCenter.return_value = center
+            workspace.accessibilityDisplayShouldReduceMotion.return_value = False
+            self.controller.start_status_display_notifications()
+            self.controller.start_status_display_notifications()
+            self.controller.set_status(sb.STATE_WORKING)
+            timer = self.controller.status_animation_timer
+
+            workspace.accessibilityDisplayShouldReduceMotion.return_value = True
+            center.postNotificationName_object_(notification, None)
+            self.assertTrue(self.controller.status_reduce_motion)
+            self.assertFalse(timer.isValid())
+            self.assertIsNone(self.controller.status_animation_timer)
+            self.assertIs(self.button.image(), sb.status_led_image(sb.STATE_WORKING, -1))
+
+            self.controller.set_status(sb.STATE_DONE)
+            workspace.accessibilityDisplayShouldReduceMotion.return_value = False
+            center.postNotificationName_object_(notification, None)
+            self.assertIsNone(self.controller.status_animation_timer)
+            self.controller.set_status(sb.STATE_WORKING)
+            self.assertTrue(self.controller.status_animation_timer.isValid())
+
+            self.controller.stop_status_display()
+            workspace.accessibilityDisplayShouldReduceMotion.return_value = True
+            center.postNotificationName_object_(notification, None)
+            self.assertFalse(self.controller.status_reduce_motion)
+            self.assertIsNone(self.controller.status_animation_timer)
+
+    def test_timer_is_registered_in_common_run_loop_modes(self):
+        with patch.object(sb, "NSRunLoop") as run_loop:
+            self.controller.set_status(sb.STATE_WORKING)
+        run_loop.mainRunLoop.return_value.addTimer_forMode_.assert_called_once_with(
+            self.controller.status_animation_timer, sb.NSRunLoopCommonModes
+        )
+
+    def test_sleep_stops_animation_and_wake_does_not_replay_done(self):
+        self.controller.leds_enabled = False
+        self.controller.refresh_ = Mock(
+            side_effect=lambda _: self.controller.set_status(self.controller.current_state)
+        )
+        for state in (sb.STATE_WORKING, sb.STATE_ASK, sb.STATE_DONE):
+            self.controller.set_status(state)
+            timer = self.controller.status_animation_timer
+            self.controller.systemWillSleep_(None)
+            self.assertFalse(timer.isValid())
+            self.assertIsNone(self.controller.status_animation_timer)
+            self.controller.systemDidWake_(None)
+            if state != sb.STATE_DONE:
+                self.assertTrue(self.controller.status_animation_timer.isValid())
+            else:
+                self.assertIsNone(self.controller.status_animation_timer)
+                self.assertIs(
+                    self.button.image(),
+                    sb.status_led_image(sb.STATE_DONE, sb.STATUS_LED_DONE_FRAMES),
+                )
+
+    def test_termination_stops_animation_and_prevents_restarting_it(self):
+        self.controller.set_status(sb.STATE_WORKING)
+        timer = self.controller.status_animation_timer
+        with patch.object(sb.threading, "Thread"):
+            self.controller.applicationShouldTerminate_(None)
+        self.assertFalse(timer.isValid())
+        self.assertIsNone(self.controller.status_animation_timer)
+        for state in (sb.STATE_WORKING, sb.STATE_ASK):
+            self.controller.set_status(state)
+            self.assertIsNone(self.controller.status_animation_timer)
+
+    def test_missing_status_item_stops_animation(self):
+        self.controller.set_status(sb.STATE_WORKING)
+        timer = self.controller.status_animation_timer
+        self.controller.status_item = None
+        self.controller.animateStatus_(timer)
+        self.assertFalse(timer.isValid())
+        self.assertIsNone(self.controller.status_animation_timer)
+
+    def test_native_status_item_keeps_the_same_width_in_every_state(self):
+        self.controller.create_status_item()
+        item = self.controller.status_item
+        self.addCleanup(sb.NSStatusBar.systemStatusBar().removeStatusItem_, item)
+        width = item.length()
+        self.assertGreater(width, 0)
+        for state in (sb.STATE_WORKING, sb.STATE_DONE, sb.STATE_ASK, sb.STATE_IDLE):
+            self.controller.set_status(state)
+            self.assertEqual(item.length(), width)
+            self.assertEqual(item.button().frame().size.width, width)
+            self.assertGreaterEqual(width, item.button().cell().cellSize().width)
+            self.assertEqual(item.button().title(), f" {state.label}")
+
+
 class PureUiLogicTests(unittest.TestCase):
     """Label and formatting helpers -- no AppKit objects, fast and exhaustive."""
 

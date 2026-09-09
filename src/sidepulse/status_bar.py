@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import subprocess
 import threading
@@ -8,6 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -47,6 +49,7 @@ try:
         NSTextView,
         NSView,
         NSWorkspace,
+        NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
         NSWorkspaceDidWakeNotification,
         NSWorkspaceWillSleepNotification,
         NSWindow,
@@ -55,7 +58,7 @@ try:
         NSWindowStyleMaskTitled,
         NSVariableStatusItemLength,
     )
-    from Foundation import NSObject, NSString, NSTimer, NSURL
+    from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer, NSURL
 except ImportError as exc:  # pragma: no cover - only exercised on non-macOS setups.
     raise SystemExit(
         f"The status-bar app requires PyObjC/AppKit ({exc}):\n"
@@ -110,7 +113,10 @@ from .install import (
 )
 from .led_status import (
     AgentLedController,
+    ASK_AMBER,
     DEFAULT_LED_BRIGHTNESS,
+    DONE_GREEN,
+    WORKING_CYAN,
     apply_brightness,
     brightness_percent,
     normalize_brightness,
@@ -269,6 +275,13 @@ STATE_IDLE = StatusBarState("Idle", "circle", 4)
 STATE_WORKING = StatusBarState("Working", "arrow.triangle.2.circlepath", 2)
 STATE_DONE = StatusBarState("Done", "checkmark.circle", 3)
 STATE_ASK = StatusBarState("Ask", "questionmark.circle", 1)
+STATUS_LED_COUNT = 4
+STATUS_LED_IMAGE_SIZE = (29.0, 18.0)
+STATUS_LED_FRAME_INTERVAL = 1.0 / 24.0
+STATUS_LED_CHASE_FRAMES = 36
+STATUS_LED_DONE_FRAMES = 18
+STATUS_LED_ASK_CYCLE_SECONDS = 1.6
+STATUS_LED_ASK_FRAMES = round(STATUS_LED_ASK_CYCLE_SECONDS / STATUS_LED_FRAME_INTERVAL)
 STATUS_BAR_DEVICE_PRIORITY = ("sidepulsepro", "sidepulsedot")
 STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
     "SidePulsePro",
@@ -442,6 +455,12 @@ class StatusBarController(NSObject):
         self.remote_manager = self.build_remote_manager()
         self.event_server = None
         self.status_item = None
+        self.status_animation_timer = None
+        self.status_animation_started_at = None
+        self.status_display_notification_center = None
+        self.status_reduce_motion = bool(
+            NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        )
         self.timer = None
         self.lid_timer = None
         self.device_timer = None
@@ -511,14 +530,8 @@ class StatusBarController(NSObject):
         log_status_bar("launching status item")
         self.start_event_server()
         self.start_power_notifications()
-
-        self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
-            NSVariableStatusItemLength
-        )
-        button = self.status_item.button()
-        button.setTitle_(" Idle")
-        button.setImage_(image_for_symbol(STATE_IDLE.symbol, STATE_IDLE.label))
-        button.setToolTip_("SidePulse Agent Monitor: Idle")
+        self.start_status_display_notifications()
+        self.create_status_item()
         log_status_bar("status item created")
 
         self.refresh_(None)
@@ -574,6 +587,7 @@ class StatusBarController(NSObject):
     @objc.IBAction
     def systemWillSleep_(self, _notification):
         self.system_sleeping = True
+        self.stop_status_animation()
         self.led_sleep_generation += 1
         self.led_animation_token += 1
         self.led_animation_until_monotonic = 0.0
@@ -960,6 +974,7 @@ class StatusBarController(NSObject):
 
         self.termination_cleanup_started = True
         self.remote_manager_started = False
+        self.stop_status_display()
         self.stop_power_notifications()
         self.stop_event_server()
         self.closed_lid_awake.release()
@@ -1034,6 +1049,7 @@ class StatusBarController(NSObject):
         NSApp.replyToApplicationShouldTerminate_(True)
 
     def applicationWillTerminate_(self, _notification):
+        self.stop_status_display()
         self.stop_power_notifications()
         self.stop_event_server()
         self.remote_manager_started = False
@@ -1049,19 +1065,127 @@ class StatusBarController(NSObject):
         self.closed_lid_awake.release()
         self.keep_awake.release()
 
+    def create_status_item(self) -> None:
+        self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        button = self.status_item.button()
+        button.setImage_(status_led_image(STATE_WORKING, -1))
+        width = 0.0
+        for state in (STATE_IDLE, STATE_WORKING, STATE_DONE, STATE_ASK):
+            button.setTitle_(f" {state.label}")
+            width = max(width, button.frame().size.width)
+        self.status_item.setLength_(math.ceil(width))
+        self.set_status(self.current_state)
+
+    def start_status_display_notifications(self) -> None:
+        if self.status_display_notification_center is not None:
+            return
+        center = NSWorkspace.sharedWorkspace().notificationCenter()
+        center.addObserver_selector_name_object_(
+            self,
+            "statusDisplayOptionsChanged:",
+            NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+            None,
+        )
+        self.status_display_notification_center = center
+        self.statusDisplayOptionsChanged_(None)
+
+    def stop_status_display(self) -> None:
+        self.stop_status_animation()
+        center = self.status_display_notification_center
+        if center is not None:
+            center.removeObserver_name_object_(
+                self,
+                NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+                None,
+            )
+            self.status_display_notification_center = None
+
+    @objc.IBAction
+    def statusDisplayOptionsChanged_(self, _notification):
+        reduce_motion = bool(
+            NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        )
+        if reduce_motion != self.status_reduce_motion:
+            self.status_reduce_motion = reduce_motion
+            self.stop_status_animation()
+            self.animateStatus_(None)
+
     def set_status(self, state: StatusBarState) -> None:
         previous = self.current_state
         self.current_state = state
+        if previous != state:
+            self.stop_status_animation()
+            if state == STATE_DONE and not self.status_reduce_motion:
+                self.status_animation_started_at = time.monotonic()
         if self.status_item is None:
             return
         button = self.status_item.button()
         if button is None:
             return
         button.setTitle_(f" {state.label}")
-        button.setImage_(image_for_symbol(state.symbol, state.label))
         button.setToolTip_(f"SidePulse Agent Monitor: {state.label}")
+        button.setAccessibilityLabel_(f"SidePulse Agent Monitor: {state.label}")
+        self.animateStatus_(None)
         if previous != state:
             log_status_bar(f"state={state.label}")
+
+    def stop_status_animation(self) -> None:
+        if self.status_animation_timer is not None:
+            self.status_animation_timer.invalidate()
+            self.status_animation_timer = None
+        self.status_animation_started_at = None
+
+    @objc.IBAction
+    def animateStatus_(self, _timer):
+        button = self.status_item.button() if self.status_item is not None else None
+        if button is None:
+            self.stop_status_animation()
+            return
+        state = self.current_state
+        animate = not (
+            self.status_reduce_motion
+            or self.system_sleeping
+            or self.termination_cleanup_started
+        )
+        if state in (STATE_WORKING, STATE_ASK):
+            frame = -1
+            if animate:
+                if self.status_animation_started_at is None:
+                    self.status_animation_started_at = time.monotonic()
+                elapsed = max(0.0, time.monotonic() - self.status_animation_started_at)
+                if state == STATE_ASK:
+                    frame = int(
+                        elapsed * STATUS_LED_ASK_FRAMES / STATUS_LED_ASK_CYCLE_SECONDS
+                    ) % STATUS_LED_ASK_FRAMES
+                else:
+                    frame = int(elapsed / STATUS_LED_FRAME_INTERVAL) % STATUS_LED_CHASE_FRAMES
+            button.setImage_(status_led_image(state, frame))
+        elif state == STATE_DONE:
+            frame = STATUS_LED_DONE_FRAMES
+            if animate and self.status_animation_started_at is not None:
+                elapsed = max(0.0, time.monotonic() - self.status_animation_started_at)
+                frame = min(STATUS_LED_DONE_FRAMES, int(elapsed / STATUS_LED_FRAME_INTERVAL))
+            button.setImage_(status_led_image(state, frame))
+            animate = frame < STATUS_LED_DONE_FRAMES
+        else:
+            button.setImage_(image_for_symbol(state.symbol, state.label))
+            animate = False
+
+        if not animate:
+            self.stop_status_animation()
+        elif self.status_animation_timer is None:
+            self.status_animation_timer = (
+                NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                    STATUS_LED_FRAME_INTERVAL, self, "animateStatus:", None, True
+                )
+            )
+            self.status_animation_timer.setTolerance_(0.005)
+            # Common modes keep the LEDs animating while the menu is tracking.
+            NSRunLoop.mainRunLoop().addTimer_forMode_(
+                self.status_animation_timer, NSRunLoopCommonModes
+            )
 
     def build_monitor(self) -> LiveAgentMonitor:
         socket_path = default_event_socket_path()
@@ -5941,6 +6065,69 @@ def project_name_from_cwd(cwd: str | None) -> str | None:
         if (candidate / ".git").exists():
             return candidate.name or str(candidate)
     return path.name or cwd
+
+
+def status_led_brightness(state: StatusBarState, frame: int) -> tuple[float, ...]:
+    if state in (STATE_WORKING, STATE_ASK) and frame < 0:
+        return (0.8,) * STATUS_LED_COUNT
+    if state == STATE_WORKING:
+        position = (frame % STATUS_LED_CHASE_FRAMES) * STATUS_LED_COUNT / STATUS_LED_CHASE_FRAMES
+        levels = []
+        for index in range(STATUS_LED_COUNT):
+            distance = abs(
+                (index - position + STATUS_LED_COUNT / 2) % STATUS_LED_COUNT
+                - STATUS_LED_COUNT / 2
+            )
+            highlight = math.cos(min(1.0, distance) * math.pi / 2) ** 2
+            levels.append(0.28 + 0.72 * highlight)
+        return tuple(levels)
+    if state == STATE_ASK:
+        phase = (frame % STATUS_LED_ASK_FRAMES) / STATUS_LED_ASK_FRAMES
+        return (0.35 + 0.65 * math.sin(math.pi * phase) ** 2,) * STATUS_LED_COUNT
+    if state == STATE_DONE:
+        progress = min(1.0, max(0.0, frame / STATUS_LED_DONE_FRAMES))
+        return (0.72 + 0.28 * math.sin(math.pi * progress) ** 2,) * STATUS_LED_COUNT
+    raise ValueError(f"No status LEDs for {state.label}")
+
+
+@lru_cache(maxsize=128)
+def status_led_image(state: StatusBarState, frame: int):
+    levels = status_led_brightness(state, frame)
+    color = chart_color({
+        STATE_WORKING: WORKING_CYAN,
+        STATE_DONE: DONE_GREEN,
+        STATE_ASK: ASK_AMBER,
+    }[state])
+
+    def draw(_rect):
+        for index, brightness in enumerate(levels):
+            x = 2.0 + index * 7.0
+            fill_rounded_rect(
+                x - 1.0, 4.0, 6.0, 10.0, 2.0,
+                color.colorWithAlphaComponent_(0.12 * brightness),
+            )
+            fill_rounded_rect(
+                x - 0.25, 4.75, 4.5, 8.5, 1.5,
+                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.18),
+            )
+            fill_rounded_rect(
+                x, 5.0, 4.0, 8.0, 1.25,
+                color.blendedColorWithFraction_ofColor_(
+                    1.0 - brightness, NSColor.blackColor()
+                ),
+            )
+            fill_rounded_rect(
+                x + 0.75, 10.75, 2.5, 0.75, 0.375,
+                NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.18 * brightness),
+            )
+        return True
+
+    image = NSImage.imageWithSize_flipped_drawingHandler_(
+        STATUS_LED_IMAGE_SIZE, False, draw
+    )
+    image.setTemplate_(False)
+    image.setAccessibilityDescription_(state.label)
+    return image
 
 
 def image_for_symbol(symbol: str, description: str):
