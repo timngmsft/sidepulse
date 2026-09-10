@@ -23,13 +23,22 @@ public enum HookConfiguration {
         }
     }
 
-    public static func command(provider: Provider, helper: URL, socket: URL) throws -> String {
+    public static func command(provider: Provider, helper: URL, socket: URL, event: String? = nil) throws -> String {
         for path in [helper.path, socket.path] {
             guard path.rangeOfCharacter(from: .controlCharacters) == nil else {
                 throw NativeError("Hook paths cannot contain control characters.")
             }
         }
-        return "\(shellQuote(helper.path)) --provider \(provider.rawValue) --socket \(shellQuote(socket.path)) # sidepulse-native"
+        var invocation = "\(shellQuote(helper.path)) --provider \(provider.rawValue) --socket \(shellQuote(socket.path))"
+        if let event {
+            guard events(for: provider).contains(event) else { throw NativeError("Unsupported hook event.") }
+            invocation += " --event \(shellQuote(event))"
+        }
+        if provider == .copilot {
+            // An observational hook must not deny Copilot tools if the app was moved or removed.
+            invocation += " || { printf '%s\\n' 'SidePulse Native hook failed; Copilot will continue.' >&2; }"
+        }
+        return invocation + " # sidepulse-native"
     }
 
     public static func render(provider: Provider, original: String, helper: URL, socket: URL,
@@ -71,7 +80,11 @@ public enum HookConfiguration {
             for event in events(for: provider) {
                 var entries = hooks[event]?.array ?? []
                 if provider == .copilot {
-                    entries.append(.object(["type": .string("command"), "bash": .string(command), "timeoutSec": .number(5)]))
+                    let eventCommand = try self.command(provider: provider, helper: helper, socket: socket, event: event)
+                    entries.append(.object([
+                        "type": .string("command"), "bash": .string(eventCommand),
+                        "timeoutSec": .number(5)
+                    ]))
                 } else {
                     var entry: [String: JSONValue] = [
                         "hooks": .array([.object(["type": .string("command"), "command": .string(command)])])

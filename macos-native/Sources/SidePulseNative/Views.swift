@@ -29,7 +29,7 @@ struct DashboardView: View {
                     Button { model.notice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
                 }.padding(12).background(Color.accentColor.opacity(0.08))
             }
-            if model.development {
+            if model.mode.permitsSimulation {
                 HStack(spacing: 8) {
                     Text("Preview").font(.caption).foregroundStyle(.secondary)
                     ForEach(DisplayState.allCases, id: \.self) { state in
@@ -44,7 +44,9 @@ struct DashboardView: View {
                         VStack(spacing: 12) {
                             Image(systemName: "waveform.path").font(.system(size: 35)).foregroundStyle(.secondary)
                             Text("Your agents, at a glance").font(.headline)
-                            Text("Install native hooks in Settings to receive activity from Codex, Claude, GitHub Copilot, and Grok.")
+                            Text(model.mode == .copilotTesting
+                                 ? "Install GitHub Copilot hooks in Settings, then start a new Copilot CLI session."
+                                 : "Install native hooks in Settings to receive activity from Codex, Claude, GitHub Copilot, and Grok.")
                                 .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                             Button("Set Up Agent Hooks") {
                                 model.settingsSection = .hooks
@@ -52,11 +54,19 @@ struct DashboardView: View {
                             }.buttonStyle(.borderedProminent)
                         }.frame(maxWidth: .infinity).padding(.vertical, 28)
                     } else {
-                        ForEach(Array(model.snapshot.sessions.prefix(30))) { session in
-                            SessionRow(model: model, session: session)
+                        ForEach(model.snapshot.listSections) { section in
+                            HStack {
+                                Text(section.title.uppercased())
+                                Spacer()
+                                Text("\(section.sessions.count)")
+                            }.font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                                .padding(.top, 4)
+                            ForEach(section.sessions) { session in
+                                SessionRow(model: model, session: session)
+                            }
                         }
                     }
-                    if !model.configuration.remotes.isEmpty {
+                    if model.mode.permitsRemotes && !model.configuration.remotes.isEmpty {
                         Text("REMOTES").font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 8)
                         ForEach(model.configuration.remotes) { remote in
                             HStack {
@@ -79,7 +89,7 @@ struct DashboardView: View {
                     Text("\(Int(battery.percent))%").monospacedDigit()
                 }
                 Spacer()
-                Text(model.configuration.physicalLEDsEnabled ? "\(model.devices.count) device\(model.devices.count == 1 ? "" : "s")" : "Hardware output off")
+                Text(model.configuration.physicalLEDsEnabled && !model.development ? "\(model.devices.count) device\(model.devices.count == 1 ? "" : "s")" : "Hardware output off")
                     .foregroundStyle(.secondary)
             }.font(.caption).padding(.horizontal, 16).padding(.vertical, 10)
             HStack {
@@ -101,14 +111,30 @@ private struct SessionRow: View {
     }
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Circle().fill(mode.display.color).frame(width: 8, height: 8).padding(.top, 6)
+            Group {
+                if mode.display == .done {
+                    Image(systemName: "checkmark").font(.system(size: 11, weight: .bold))
+                } else {
+                    Circle().frame(width: 8, height: 8)
+                }
+            }.foregroundStyle(mode.display.color).frame(width: 12, height: 12).padding(.top, 4)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(session.title).font(.callout.weight(.semibold)).lineLimit(1)
+                    .help(session.cwd ?? session.title)
                 HStack {
                     Text(session.provider.title)
                     if session.remoteID != nil { Image(systemName: "network") }
-                    Text("· \(mode.display.rawValue)")
+                    Text("· \(session.statusLabel)")
                 }.font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    if let reference = session.referenceLabel {
+                        Text(reference).font(.system(.caption2, design: .monospaced))
+                        Text("·")
+                    }
+                    Text(session.updatedAt, style: .time)
+                }.font(.caption2).foregroundStyle(.secondary)
+                    .help("Last activity: \(session.updatedAt.formatted())\n\(session.id)")
                 if let message = session.message, mode.display == .ask {
                     Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
                 }
@@ -122,6 +148,8 @@ private struct SessionRow: View {
                 Button("Dismiss Session") { model.forget(session) }
             } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 24)
         }.padding(11).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("session-\(session.id)")
     }
 }
 
@@ -134,8 +162,8 @@ struct SettingsView: View {
     @ObservedObject var model: AppModel
     var body: some View {
         VStack(spacing: 0) {
-            if model.development {
-                Label("Isolated development mode: hooks, hardware output, and login changes are disabled.", systemImage: "shield")
+            if let explanation = model.mode.explanation {
+                Label(explanation, systemImage: "shield")
                     .font(.caption).padding(12).frame(maxWidth: .infinity).background(.orange.opacity(0.1))
             }
             Picker("Settings", selection: $model.settingsSection) {
@@ -146,7 +174,7 @@ struct SettingsView: View {
                 case .general: general
                 case .hooks: hooks
                 case .devices: devices
-                case .remotes: RemotesView(model: model)
+                case .remotes: RemotesView(model: model).disabled(!model.mode.permitsRemotes)
                 case .history: HistoryView(model: model)
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -211,18 +239,33 @@ struct SettingsView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(provider.title).font(.headline)
-                            Text(model.installedHooks[provider] == true ? "Native hooks installed" : "Not installed")
+                            Text(model.mode.permitsHookChanges(for: provider)
+                                 ? (model.installedHooks[provider] == true ? "Native hooks installed" : "Not installed")
+                                 : "Disabled in this mode")
                                 .font(.caption).foregroundStyle(.secondary)
+                            if provider == .copilot && model.installedHooks[provider] == true {
+                                if let latest = model.snapshot.sessions.filter({ $0.provider == .copilot })
+                                    .max(by: { $0.observedAt < $1.observedAt }) {
+                                    Text("Last event: \(latest.event)").font(.caption).foregroundStyle(.secondary)
+                                } else {
+                                    Text("Waiting for activity. Start a new Copilot CLI session.")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
                         }
                         Spacer()
                         if model.installedHooks[provider] == true {
                             Button("Remove") { model.installHooks(provider, removing: true) }
                         }
                         Button(model.installedHooks[provider] == true ? "Update" : "Install") { model.installHooks(provider) }
-                    }.disabled(model.development)
+                    }.disabled(!model.mode.permitsHookChanges(for: provider))
                 }
                 Text("Existing hooks are preserved. Configurations are backed up before changes. Restart the agent after installing; Codex may ask you to approve the new hooks.")
                     .font(.caption).foregroundStyle(.secondary)
+                if model.mode.permitsHookChanges(for: .copilot) {
+                    Text("Copilot configuration: \(HookConfiguration.file(for: .copilot, home: FileManager.default.homeDirectoryForCurrentUser).path)")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
             }
         }.formStyle(.grouped)
     }

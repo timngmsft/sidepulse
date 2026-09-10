@@ -13,6 +13,7 @@ public final class SessionStore {
 
     @discardableResult
     public func ingest(_ event: NormalizedEvent) -> Bool {
+        guard event.updatesStatus else { return false }
         var incoming = event.session
         if let previous = sessionsByID[incoming.id] {
             guard incoming.updatedAt >= previous.updatedAt else { return false }
@@ -65,7 +66,7 @@ public final class SessionStore {
         for index in sessions.indices { sessions[index].mode = modes[index] }
         return MonitorSnapshot(
             state: modes.min(by: { $0.priority < $1.priority })?.display ?? .idle,
-            sessions: sessions, activeCount: modes.filter { $0 != .idle && $0 != .completed }.count,
+            sessions: sessions, activeCount: modes.filter(\.isActive).count,
             generatedAt: now
         )
     }

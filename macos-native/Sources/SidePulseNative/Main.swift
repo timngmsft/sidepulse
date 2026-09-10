@@ -31,7 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let paths = NativePaths(root: root)
             let firstLaunch = !FileManager.default.fileExists(atPath: paths.configuration.path)
-            let model = try AppModel(paths: paths, development: args.contains("--development"))
+            let mode: ApplicationMode = args.contains("--copilot-testing") ? .copilotTesting :
+                args.contains("--development") ? .preview : .standard
+            let model = try AppModel(paths: paths, mode: mode)
             self.model = model
             configureMenu()
             status = StatusItemController(model: model)
@@ -42,7 +44,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return try self.capture(kind: kind)
             }
             try model.start()
-            if firstLaunch || args.contains("--show-window") { openWelcome() }
+            if args.contains("--show-hooks") {
+                model.settingsSection = .hooks
+                openSettings()
+            } else if firstLaunch || args.contains("--show-window") { openWelcome() }
         } catch {
             FileHandle.standardError.write(Data("SidePulse Native startup: \(error.localizedDescription)\n".utf8))
             let alert = NSAlert()

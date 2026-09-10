@@ -1,6 +1,6 @@
 # SidePulse Native for macOS
 
-A standalone Swift/AppKit and SwiftUI application, developed independently of the existing Python implementation. All native source, build output, and development data stay in this folder.
+A standalone Swift/AppKit and SwiftUI application, developed independently of the existing Python implementation. Native source and build output stay in this folder; live application data uses its own native namespace.
 
 The application owns monitoring, settings, history, and the UI. Its bundled `SidePulseHook` executable is a small, one-shot event transport used by agent hooks, not a separate service. Running the app requires neither Python, PyObjC, a Python environment, nor the existing `sidepulse` / `agent-monitor` CLI.
 
@@ -41,11 +41,30 @@ Normal application data is stored separately in:
 
 The bundle identifier is `io.sidepulse.native`. Its private event socket is `/tmp/io.sidepulse.native-<uid>/events.sock`; development instances with a short `--state-dir` use an `events.sock` inside that directory. Longer paths get a stable, separately namespaced socket under `/tmp`. The original application's files and socket are not reused.
 
+## Copilot-only live testing
+
+The **Install** buttons are intentionally disabled in the simulated preview. Quit that instance, then start the restricted live-testing mode from the repository root:
+
+```sh
+./start-native.sh
+```
+
+Only **GitHub Copilot > Install / Update / Remove** is enabled in this mode. The other providers, remote connections, physical output, keep-awake, eject prevention, and login registration remain disabled. No hooks are installed automatically.
+
+Click **Install** and confirm the displayed path. This creates or updates only `~/.copilot/hooks/sidepulse-native.json` (or the equivalent under `COPILOT_HOME`). Existing Copilot hooks, including the original SidePulse installation, are preserved. Start a new Copilot CLI session afterward. The Agent Hooks page distinguishes an installed configuration from receiving actual events.
+
+Without a `--state-dir` override, this mode uses the normal native data directory and socket. Those hook commands therefore keep working when the app is subsequently opened normally; they do not point into the temporary preview directory.
+
+Copilot hooks use PascalCase event names to select VS Code-compatible input and pass their registered event name as a legacy-format fallback. Permission and question-dialog notifications produce **Ask**; background completion notifications do not end an active or waiting parent session. For a Stop event that lacks reply text, the native helper reads at most the final 256 KiB of the supplied transcript to find the latest assistant reply. This is an on-demand read, not transcript polling or an ML classifier.
+
+The hook commands emit no permission decisions and remain non-blocking for Copilot even if the app bundle is moved, removed, or unavailable. Failures are reported to stderr; the running helper queues events when the receiver is offline.
+
 ## Features
 
 - Fixed-width menu-bar item: four cyan LEDs chase for **Working**, red-orange LEDs breathe together for **Ask**, and green LEDs pulse once and settle for **Done**. **Idle** is dim and static.
 - Core Animation rather than a per-frame application timer. Animations respect Reduce Motion and pause when displays sleep.
 - Native dashboard and settings, multi-agent priority, pending permission tracking, stale-activity expiry, session persistence, and recent history with JSON export.
+- Separate **Active** and **Recent** session sections, with short session/agent IDs and last-activity times. Completed items use a green checkmark instead of a status dot. Ended sessions are labeled **Ended**, so independent sessions in the same workspace do not look like duplicate agents.
 - Opt-in hook setup for Codex, Claude, GitHub Copilot, and Grok. Existing unrelated hooks are retained, and configuration files are backed up before changes.
 - A bounded offline event queue, drained when the application starts or resumes receiving activity. Older events do not overwrite newer state.
 - Optional SidePulse Pro / Dot LED output, per-device brightness, agent and battery patterns, and custom `LEDS.LED` programs. Programs are written in place and constrained to the firmware's 512-byte / 20-line limits.
@@ -62,7 +81,7 @@ To receive real activity, open the app normally and explicitly install the desir
 This is a separate native implementation, not a complete migration of every legacy feature:
 
 - It does not import the original application's preferences, hooks, history, or installation state.
-- Local activity requires native hooks. The legacy transcript-only polling fallback is not included; question detection uses the message supplied by the hook.
+- Local activity requires native hooks. The legacy transcript-only polling fallback is not included. Copilot Stop hooks can read the latest reply from their supplied transcript; other providers use reply text supplied by their hooks.
 - Local session actions open the workspace or a terminal; provider-specific resume/deep-link behavior is not yet implemented.
 - The native on-screen strip represents agent state, not a full firmware/WASM custom-program simulator.
 - Keep-awake does not modify global power settings or override closed-lid sleep.
@@ -77,7 +96,7 @@ This is a separate native implementation, not a complete migration of every lega
 ./macos-native/smoke-test.sh
 ```
 
-Core XCTest coverage includes event normalization, question detection, aggregation, permissions, expiry, hook preservation, Herdr transitions, native IPC, offline events, and LED write scheduling. The smoke script also opens a relocated app bundle with isolated data and drives its bundled helper through the actual UI's Working / Ask / Done transitions, completion settling and expiry, window rendering, persistence, and offline replay.
+Core XCTest coverage includes event normalization, question detection, aggregation, permissions, expiry, hook preservation, Herdr transitions, native IPC, offline events, and LED write scheduling. Copilot coverage includes restricted-mode policy, dialog notifications, bounded transcript reads, compatible hook payloads, and a missing-helper fail-open case. The smoke script opens a relocated app bundle with isolated data and drives its bundled helper through the actual UI's Working / Ask / Done transitions, completion settling and expiry, window rendering, persistence, and offline replay. It also installs Copilot hooks in a fixture home, executes the actual generated commands, and removes them without modifying real agent configuration.
 
 For manual development events:
 
@@ -90,7 +109,7 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"demo"}' |
   --socket "$PWD/macos-native/.run/events.sock" --snapshot
 ```
 
-The helper also accepts `--ping`. Development-only `--request` actions include `clear`, `capture`, `capture-status`, `capture-settings`, `capture-hooks`, `capture-devices`, `capture-remotes`, `capture-history`, `show-settings`, and `quit`. Captures render only this application's own views and windows, not the desktop. These diagnostics are not needed for normal use.
+The helper also accepts `--ping`. Preview and Copilot-testing `--request` actions include `clear`, `capture`, `capture-status`, `capture-settings`, `capture-hooks`, `capture-devices`, `capture-remotes`, `capture-history`, `show-settings`, and `quit`. Captures render only this application's own views and windows, not the desktop. These diagnostics are not needed for normal use.
 
 ```text
 Sources/SidePulseCore/     Event/state logic, IPC, hooks, persistence, LED programs

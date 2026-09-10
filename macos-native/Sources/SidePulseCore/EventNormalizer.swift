@@ -3,6 +3,7 @@ import Foundation
 public struct NormalizedEvent: Sendable {
     public var session: AgentSession
     public var permissionKey: String?
+    public var updatesStatus = true
 }
 
 public enum EventNormalizer {
@@ -41,9 +42,16 @@ public enum EventNormalizer {
         let cwd = raw.text("cwd", "workspaceRoot")
         let key = agentID.map { "agent:\($0)" } ?? sessionID.map { "session:\($0)" } ?? "cwd:\(cwd ?? "unknown")"
         let message = raw.text("last_assistant_message", "lastAssistantMessage", "message")
-        let mode = try mode(for: event, raw: raw, message: message)
-        let timestamp = parseDate(outer["logged_at"] ?? raw["logged_at"] ?? raw["timestamp"]) ?? now
-        let title = raw.text("session_title", "sessionTitle", "title")
+            ?? (provider == .copilot ? raw["error"]?["message"]?.string ?? raw["error"]?.string : nil)
+            ?? (provider == .copilot && event == "SubagentStop" ? raw.text("response") : nil)
+        let notification = raw.text("notification_type", "notificationType")
+        let copilotNotification = provider == .copilot && event == "Notification" && notification != nil
+        let needsAttention = ["permission_prompt", "elicitation_dialog"].contains(notification ?? "")
+        let mode = copilotNotification && needsAttention ? AgentMode.waiting : try mode(for: event, raw: raw, message: message)
+        let eventTime = provider == .copilot ? parseDate(raw["timestamp"]) : nil
+        let timestamp = eventTime ?? parseDate(outer["logged_at"] ?? raw["logged_at"] ?? raw["timestamp"]) ?? now
+        let title = raw.text("session_title", "sessionTitle")
+            ?? (provider == .copilot && event == "Notification" ? nil : raw.text("title"))
             ?? cwd.map { URL(fileURLWithPath: $0).lastPathComponent }
             ?? "\(provider.title) \(String((sessionID ?? agentID ?? "session").prefix(8)))"
         let session = AgentSession(
@@ -54,7 +62,8 @@ public enum EventNormalizer {
         )
         let permissionKey = raw.text("tool_use_id", "toolUseId", "tool_call_id", "toolCallId", "call_id")
             ?? raw.text("tool_name", "toolName")
-        return NormalizedEvent(session: session, permissionKey: permissionKey)
+        return NormalizedEvent(session: session, permissionKey: permissionKey,
+                               updatesStatus: !copilotNotification || needsAttention)
     }
 
     private static func mode(for event: String, raw: [String: JSONValue], message: String?) throws -> AgentMode {

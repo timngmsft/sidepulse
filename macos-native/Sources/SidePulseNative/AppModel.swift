@@ -16,7 +16,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var keepingAwake = false
     @Published var settingsSection = SettingsSection.general
     let paths: NativePaths
-    let development: Bool
+    let mode: ApplicationMode
+    var development: Bool { mode.restrictsSystemChanges }
     private let store: SessionStore
     private let devicesService = DeviceService()
     private let awake = AwakeService()
@@ -35,8 +36,8 @@ final class AppModel: ObservableObject {
     var renderDiagnostics: (() -> [String: JSONValue])?
     var captureWindow: ((String) throws -> URL)?
 
-    init(paths: NativePaths, development: Bool) throws {
-        self.paths = paths; self.development = development
+    init(paths: NativePaths, mode: ApplicationMode) throws {
+        self.paths = paths; self.mode = mode
         try paths.prepare()
         let loaded = try Persistence.load(AppConfiguration.self, from: paths.configuration) ?? AppConfiguration()
         try loaded.validate()
@@ -94,7 +95,7 @@ final class AppModel: ObservableObject {
         batteryTimer?.tolerance = 5
         if let batteryTimer { RunLoop.main.add(batteryTimer, forMode: .common) }
         log("Started standalone native app; socket=\(paths.socket.path)")
-        if development { notice = "Development instance: existing SidePulse files and hooks have not been changed." }
+        notice = mode.explanation
     }
 
     func stop() {
@@ -142,13 +143,14 @@ final class AppModel: ObservableObject {
     }
 
     func installHooks(_ provider: Provider, removing: Bool = false) {
-        guard !development else {
-            report("Hook installation is disabled in development mode. Open the built .app normally when ready to switch.")
+        guard mode.permitsHookChanges(for: provider) else {
+            report(mode.explanation ?? "Hook installation is unavailable in this mode.")
             return
         }
+        let file = HookConfiguration.file(for: provider, home: FileManager.default.homeDirectoryForCurrentUser)
         let alert = NSAlert()
         alert.messageText = removing ? "Remove native \(provider.title) hooks?" : "Install native \(provider.title) hooks?"
-        alert.informativeText = "Only SidePulse Native entries will be changed. Other hooks are preserved and the configuration is backed up first. Restart the agent afterward."
+        alert.informativeText = "Configuration: \(file.path)\n\nOnly SidePulse Native entries will be changed. Other hooks are preserved and existing configuration is backed up first. Restart the agent afterward."
         alert.addButton(withTitle: removing ? "Remove" : "Install")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -162,7 +164,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshHooks() {
-        for provider in Provider.allCases {
+        for provider in Provider.allCases where mode != .copilotTesting || provider == .copilot {
             installedHooks[provider] = HookConfiguration.isInstalled(provider: provider, home: FileManager.default.homeDirectoryForCurrentUser)
         }
     }
@@ -180,7 +182,7 @@ final class AppModel: ObservableObject {
     }
 
     func preview(_ state: DisplayState) {
-        guard development else { report("Simulated states are only available in development mode."); return }
+        guard mode.permitsSimulation else { report("Simulated states are only available in preview mode."); return }
         if state == .idle { clearSessions(); return }
         do {
             let event = try EventNormalizer.normalize(HookEnvelope(provider: .codex, line: .object([
@@ -210,6 +212,7 @@ final class AppModel: ObservableObject {
     }
 
     func authenticate(_ remote: RemoteConfiguration) {
+        guard mode.permitsRemotes else { report("Remote connections are disabled during Copilot-only testing."); return }
         let control = controlPath(for: remote)
         let command = "/usr/bin/ssh -M -S \(HookConfiguration.shellQuote(control.path)) -o ControlPersist=600 -fN -- \(HookConfiguration.shellQuote(remote.target))"
         openCommand(command + "\nprintf '\\nAuthentication finished. You can close this window.\\n'", name: "authenticate-\(remote.id)")
@@ -251,6 +254,11 @@ final class AppModel: ObservableObject {
                     let encoded = try JSONCoding.encoder().encode(store.snapshot())
                     var object = try JSONDecoder().decode(JSONValue.self, from: encoded).object ?? [:]
                     object["ui"] = .object(renderDiagnostics?() ?? [:])
+                    object["mode"] = .string(mode.rawValue)
+                    object["hookChangesAllowed"] = .object(Dictionary(uniqueKeysWithValues: Provider.allCases.map {
+                        ($0.rawValue, .bool(mode.permitsHookChanges(for: $0)))
+                    }))
+                    object["systemChangesAllowed"] = .bool(!mode.restrictsSystemChanges)
                     object["ok"] = .bool(true)
                     return try JSONEncoder().encode(JSONValue.object(object))
                 case "clear" where development:
@@ -376,7 +384,7 @@ final class AppModel: ObservableObject {
         for worker in remoteWorkers.values { worker.stop() }
         remoteWorkers.removeAll()
         remoteStatus.removeAll()
-        for remote in configuration.remotes where remote.enabled {
+        for remote in configuration.remotes where remote.enabled && mode.permitsRemotes {
             let worker = RemoteWorker(configuration: remote, controlPath: controlPath(for: remote)) { [weak self] sessions, error in
                 guard let self, !self.quitting, self.remoteGeneration == generation else { return }
                 self.remoteStatus[remote.id] = error ?? "Connected"

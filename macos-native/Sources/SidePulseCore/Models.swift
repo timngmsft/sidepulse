@@ -109,6 +109,7 @@ public enum AgentMode: String, Codable, CaseIterable, Sendable {
         }
     }
     public var isWorking: Bool { display == .working }
+    public var isActive: Bool { self != .idle && self != .completed }
     public static func parse(_ text: String) -> AgentMode? {
         let key = text.lowercased().replacingOccurrences(of: "-", with: "_")
         if let exact = AgentMode(rawValue: key) { return exact }
@@ -153,6 +154,22 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
         if mode == .completed && now.timeIntervalSince(updatedAt) > doneVisible { return .idle }
         return mode
     }
+
+    public var statusLabel: String { event == "SessionEnd" ? "Ended" : mode.display.rawValue }
+
+    public var referenceLabel: String? {
+        let agentPrefix = "\(provider.rawValue):agent:"
+        if id.hasPrefix(agentPrefix) {
+            return "Agent \(id.dropFirst(agentPrefix.count).prefix(8))"
+        }
+        return sessionID.map { "Session \($0.prefix(8))" }
+    }
+}
+
+public struct SessionListSection: Identifiable {
+    public var title: String
+    public var sessions: [AgentSession]
+    public var id: String { title }
 }
 
 public struct MonitorSnapshot: Codable, Sendable {
@@ -163,6 +180,14 @@ public struct MonitorSnapshot: Codable, Sendable {
     public init(state: DisplayState, sessions: [AgentSession], activeCount: Int, generatedAt: Date) {
         self.state = state; self.sessions = sessions
         self.activeCount = activeCount; self.generatedAt = generatedAt
+    }
+
+    public var listSections: [SessionListSection] {
+        let visible = Array(sessions.prefix(30))
+        return [
+            SessionListSection(title: "Active", sessions: visible.filter { $0.mode.isActive }),
+            SessionListSection(title: "Recent", sessions: visible.filter { !$0.mode.isActive })
+        ].filter { !$0.sessions.isEmpty }
     }
 }
 

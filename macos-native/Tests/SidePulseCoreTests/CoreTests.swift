@@ -46,6 +46,44 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(store.snapshot(at: now.addingTimeInterval(1201)).state, .idle)
     }
 
+    func testSameWorkspaceSessionsRemainDistinctAndShowActiveVersusEnded() throws {
+        let store = SessionStore()
+        store.ingest(try event("SessionEnd", id: "22222222-ended"))
+        store.ingest(try event("UserPromptSubmit", id: "11111111-active", offset: 1))
+        let snapshot = store.snapshot(at: now.addingTimeInterval(1))
+        XCTAssertEqual(snapshot.sessions.count, 2)
+        XCTAssertEqual(Set(snapshot.sessions.map(\.title)), ["project"])
+        XCTAssertEqual(snapshot.state, .working)
+        XCTAssertEqual(snapshot.activeCount, 1)
+        XCTAssertEqual(snapshot.listSections.map(\.title), ["Active", "Recent"])
+        let active = try XCTUnwrap(snapshot.listSections.first?.sessions.first)
+        let ended = try XCTUnwrap(snapshot.listSections.last?.sessions.first)
+        XCTAssertEqual(active.referenceLabel, "Session 11111111")
+        XCTAssertEqual(ended.referenceLabel, "Session 22222222")
+        XCTAssertEqual(active.statusLabel, "Working")
+        XCTAssertEqual(ended.statusLabel, "Ended")
+
+        let expired = store.snapshot(at: now.addingTimeInterval(3602))
+        XCTAssertEqual(expired.listSections.map(\.title), ["Recent"])
+        XCTAssertEqual(expired.listSections.first?.sessions.count, 2)
+        XCTAssertEqual(expired.sessions.first { $0.sessionID == "22222222-ended" }?.statusLabel, "Ended")
+    }
+
+    func testQuestionsStayActiveAndSubagentsHaveTheirOwnReference() throws {
+        let store = SessionStore()
+        store.ingest(try event("Stop", id: "parent-session"))
+        store.ingest(try event("Stop", id: "parent-session", extra: [
+            "agent_id": .string("child-agent"), "last_assistant_message": .string("Which option?")
+        ]))
+        let snapshot = store.snapshot(at: now)
+        XCTAssertEqual(snapshot.listSections.map(\.title), ["Active", "Recent"])
+        XCTAssertEqual(snapshot.listSections[0].sessions[0].referenceLabel, "Agent child-ag")
+        XCTAssertEqual(snapshot.listSections[0].sessions[0].statusLabel, "Ask")
+        XCTAssertEqual(snapshot.listSections[1].sessions[0].referenceLabel, "Session parent-s")
+        XCTAssertEqual(snapshot.listSections[1].sessions[0].statusLabel, "Done")
+        XCTAssertEqual(snapshot.state, .ask)
+    }
+
     func testPendingApprovalSurvivesUnrelatedToolCalls() throws {
         let store = SessionStore()
         store.ingest(try event("PermissionRequest", extra: ["tool_use_id": .string("a")]))

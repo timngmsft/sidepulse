@@ -36,6 +36,11 @@ enum HookMain {
                     object["logged_at"] = .string(formatter.string(from: Date()))
                 }
                 line = .object(object)
+                if provider == .copilot {
+                    line = try CopilotHookInput.prepare(line, fallbackEvent: value("--event")) { error in
+                        FileHandle.standardError.write(Data("SidePulse Native Copilot metadata: \(error.localizedDescription)\n".utf8))
+                    }
+                }
                 payload = try JSONEncoder().encode(HookEnvelope(provider: provider, line: line))
                 pendingPayload = payload
             }

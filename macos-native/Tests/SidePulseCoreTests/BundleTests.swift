@@ -72,6 +72,8 @@ final class BundleTests: XCTestCase {
         }
         let initial = try request("snapshot")
         XCTAssertEqual(initial["state"]?.string, "Idle")
+        XCTAssertEqual(initial["mode"]?.string, "preview")
+        XCTAssertEqual(initial["hookChangesAllowed"]?["copilot"]?.bool, false)
         let width = initial["ui"]?["width"]?.number
         XCTAssertEqual(initial["ui"]?["segments"]?.number, 4)
         func assertState(_ expected: String, file: StaticString = #filePath, line: UInt = #line) throws -> JSONValue {
@@ -135,7 +137,7 @@ final class BundleTests: XCTestCase {
         XCTAssertEqual(try PendingEvents.files(socket: paths.socket).count, 1)
         let restarted = Process()
         restarted.executableURL = process.executableURL
-        restarted.arguments = process.arguments
+        restarted.arguments = ["--state-dir", root.path, "--copilot-testing"]
         restarted.standardOutput = FileHandle.nullDevice; restarted.standardError = FileHandle.nullDevice
         defer {
             if restarted.isRunning { restarted.terminate(); restarted.waitUntilExit() }
@@ -151,6 +153,64 @@ final class BundleTests: XCTestCase {
         let completed = replayed["sessions"]?.array?.first { $0["sessionID"]?.string == "question" }
         XCTAssertEqual(completed?["message"]?.string, "Finished while the application was closed.")
         XCTAssertTrue(try PendingEvents.files(socket: paths.socket).isEmpty)
+        XCTAssertEqual(replayed["mode"]?.string, "copilot-testing")
+        XCTAssertEqual(replayed["systemChangesAllowed"]?.bool, false)
+        for provider in Provider.allCases {
+            XCTAssertEqual(replayed["hookChangesAllowed"]?[provider.rawValue]?.bool, provider == .copilot)
+        }
+
+        _ = try request("clear")
+        let home = root.appendingPathComponent("fixture-home")
+        let install = try HookConfiguration.install(provider: .copilot, home: home, helper: helper, socket: paths.socket)
+        let hookConfiguration = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: install.file))
+        func runConfiguredCopilotHook(_ event: String, _ body: [String: JSONValue]) throws {
+            let command = try XCTUnwrap(hookConfiguration["hooks"]?[event]?.array?.last?["bash"]?.string)
+            let hook = Process()
+            let input = Pipe(), output = Pipe(), error = Pipe()
+            hook.executableURL = URL(fileURLWithPath: "/bin/sh")
+            hook.arguments = ["-c", command]
+            hook.standardInput = input; hook.standardOutput = output; hook.standardError = error
+            try hook.run()
+            try input.fileHandleForWriting.write(contentsOf: JSONEncoder().encode(JSONValue.object(body)))
+            try input.fileHandleForWriting.close()
+            let stdout = output.fileHandleForReading.readDataToEndOfFile()
+            let stderr = error.fileHandleForReading.readDataToEndOfFile()
+            hook.waitUntilExit()
+            XCTAssertEqual(hook.terminationStatus, 0, String(decoding: stderr, as: UTF8.self))
+            XCTAssertTrue(stdout.isEmpty, "A status hook must not return a Copilot permission decision.")
+            XCTAssertTrue(stderr.isEmpty, String(decoding: stderr, as: UTF8.self))
+        }
+        let identity: [String: JSONValue] = [
+            "session_id": .string("live-copilot"), "cwd": .string(root.path),
+            "session_title": .string("Copilot native integration")
+        ]
+        try runConfiguredCopilotHook("UserPromptSubmit", identity)
+        _ = try assertState("Working")
+        var question: [String: JSONValue] = [
+            "hook_event_name": .string("Notification"), "sessionId": .string("live-copilot"),
+            "cwd": .string(root.path)
+        ]
+        question["notification_type"] = .string("elicitation_dialog")
+        question["message"] = .string("Choose an environment")
+        try runConfiguredCopilotHook("Notification", question)
+        _ = try assertState("Ask")
+        question["notification_type"] = .string("shell_completed")
+        try runConfiguredCopilotHook("Notification", question)
+        _ = try assertState("Ask")
+        try runConfiguredCopilotHook("PostToolUse", identity)
+        _ = try assertState("Working")
+        let transcript = root.appendingPathComponent("copilot-events.jsonl")
+        try Data(#"{"type":"assistant.message","data":{"content":"Which environment should I use?"}}"#.utf8).write(to: transcript)
+        var stop = identity
+        stop["transcript_path"] = .string(transcript.path)
+        try runConfiguredCopilotHook("Stop", stop)
+        _ = try assertState("Ask")
+        try Data(#"{"type":"assistant.message","data":{"content":"Implementation complete."}}"#.utf8).write(to: transcript)
+        try runConfiguredCopilotHook("Stop", stop)
+        _ = try assertState("Done")
+        _ = try request("capture-hooks")
+        _ = try HookConfiguration.install(provider: .copilot, home: home, helper: helper, socket: paths.socket, removing: true)
+        XCTAssertFalse(HookConfiguration.isInstalled(provider: .copilot, home: home))
         _ = try request("quit")
         restarted.waitUntilExit()
     }
