@@ -262,8 +262,6 @@ class ImportContractTests(unittest.TestCase):
             if normalize_dist_name(record.top) not in declared_anywhere:
                 unknown.append(f"{record.where}: optional import {record.top!r}")
 
-        # mlx_lm is the reply-classifier extra; it maps to distribution "mlx-lm".
-        unknown = [u for u in unknown if "mlx_lm" not in u]
         self.assertEqual([], unknown, "Unrecognized optional imports:\n  " + "\n  ".join(unknown))
 
     def test_declared_dependencies_are_installed(self):

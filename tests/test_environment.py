@@ -235,12 +235,36 @@ class CleanInstallTests(unittest.TestCase):
         )
 
     def test_every_shipped_module_imports_after_plain_install(self):
+        modules = self.shipped_modules()
+        # Incremental builds can retain deleted modules in the wheel.
+        result = self.run_python(
+            """
+            import json
+            from importlib.metadata import distribution
+
+            names = []
+            for path in distribution("sidepulse").files:
+                if path.suffix != ".py" or path.name == "__main__.py":
+                    continue
+                parts = list(path.with_suffix("").parts)
+                if parts[-1] == "__init__":
+                    parts.pop()
+                names.append(".".join(parts))
+            print(json.dumps(sorted(names)))
+            """
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            sorted(modules),
+            json.loads(result.stdout),
+            "installed modules differ from the source tree",
+        )
         darwin_only = {
             "sidepulse.status_bar",
             "sidepulse.virtual_device",
             "sidepulse.led_wasm",
         }
-        for name in self.shipped_modules():
+        for name in modules:
             if name in darwin_only and sys.platform != "darwin":
                 continue
             with self.subTest(module=name):
@@ -266,7 +290,20 @@ class CleanInstallTests(unittest.TestCase):
                 )
 
     def test_console_scripts_are_installed(self):
-        expected = ("sidepulse", "agent-monitor", "agent-status-bar", "sidepulse-reply")
+        expected = ("sidepulse", "agent-monitor", "agent-status-bar")
+        result = self.run_python(
+            """
+            import json
+            from importlib.metadata import distribution
+
+            print(json.dumps(sorted(
+                entry.name for entry in distribution("sidepulse").entry_points
+                if entry.group == "console_scripts"
+            )))
+            """
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(sorted(expected), json.loads(result.stdout))
         for name in expected:
             with self.subTest(script=name):
                 self.assertTrue(
@@ -275,7 +312,7 @@ class CleanInstallTests(unittest.TestCase):
                 )
 
     def test_console_scripts_run(self):
-        for name in ("sidepulse", "agent-monitor", "sidepulse-reply"):
+        for name in ("sidepulse", "agent-monitor"):
             with self.subTest(script=name):
                 result = self.run_script(name, ["--help"])
                 self.assertIn(result.returncode, (0, 2), result.stderr)
