@@ -13,10 +13,11 @@ final class CopilotTests: XCTestCase {
         for provider in Provider.allCases {
             XCTAssertEqual(ApplicationMode.copilotTesting.permitsHookChanges(for: provider), provider == .copilot)
             XCTAssertFalse(ApplicationMode.preview.permitsHookChanges(for: provider))
-            XCTAssertTrue(ApplicationMode.standard.permitsHookChanges(for: provider))
+            XCTAssertEqual(ApplicationMode.standard.permitsHookChanges(for: provider), provider.supportsHooks)
         }
         XCTAssertTrue(ApplicationMode.copilotTesting.restrictsSystemChanges)
-        XCTAssertFalse(ApplicationMode.copilotTesting.permitsRemotes)
+        XCTAssertTrue(ApplicationMode.copilotTesting.permitsRemotes)
+        XCTAssertFalse(ApplicationMode.preview.permitsRemotes)
         XCTAssertFalse(ApplicationMode.copilotTesting.permitsSimulation)
     }
 

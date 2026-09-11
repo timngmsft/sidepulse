@@ -27,7 +27,7 @@ For Developer ID signing, supply `SIGN_IDENTITY` to `build.sh`. The default ad-h
   --development --show-window
 ```
 
-Development mode disables hook installation, physical LED output, login registration, keep-awake assertions, and eject prevention. It does not alter or restart the existing SidePulse application. The normal application also starts with hardware output and power controls disabled, and never installs hooks automatically.
+Development mode disables hook installation, remote connections, physical LED output, login registration, keep-awake assertions, and eject prevention. It does not alter or restart the existing SidePulse application. The normal application also starts with hardware output and power controls disabled, and never installs hooks automatically.
 
 The development dashboard has **Idle / Working / Ask / Done** preview buttons, so the menu-bar experience can be explored without installing hooks or running diagnostic commands.
 
@@ -41,7 +41,7 @@ Normal application data is stored separately in:
 
 The bundle identifier is `io.sidepulse.native`. Its private event socket is `/tmp/io.sidepulse.native-<uid>/events.sock`; development instances with a short `--state-dir` use an `events.sock` inside that directory. Longer paths get a stable, separately namespaced socket under `/tmp`. The original application's files and socket are not reused.
 
-## Copilot-only live testing
+## Copilot and Herdr live testing
 
 The **Install** buttons are intentionally disabled in the simulated preview. Quit that instance, then start the restricted live-testing mode from the repository root:
 
@@ -49,7 +49,7 @@ The **Install** buttons are intentionally disabled in the simulated preview. Qui
 ./start-native.sh
 ```
 
-Only **GitHub Copilot > Install / Update / Remove** is enabled in this mode. The other providers, remote connections, physical output, keep-awake, eject prevention, and login registration remain disabled. No hooks are installed automatically.
+**GitHub Copilot > Install / Update / Remove** and **Remotes** are enabled in this mode. The other local providers, physical output, keep-awake, eject prevention, and login registration remain disabled. No hooks are installed automatically. The `--copilot-testing` launch flag is retained for compatibility.
 
 Click **Install** and confirm the displayed path. This creates or updates only `~/.copilot/hooks/sidepulse-native.json` (or the equivalent under `COPILOT_HOME`). Existing Copilot hooks, including the original SidePulse installation, are preserved. Start a new Copilot CLI session afterward. The Agent Hooks page distinguishes an installed configuration from receiving actual events.
 
@@ -58,6 +58,26 @@ Without a `--state-dir` override, this mode uses the normal native data director
 Copilot hooks use PascalCase event names to select VS Code-compatible input and pass their registered event name as a legacy-format fallback. Permission and question-dialog notifications produce **Ask**; background completion notifications do not end an active or waiting parent session. For a Stop event that lacks reply text, the native helper reads at most the final 256 KiB of the supplied transcript to find the latest assistant reply. This is an on-demand read, not transcript polling or an ML classifier.
 
 The hook commands emit no permission decisions and remain non-blocking for Copilot even if the app bundle is moved, removed, or unavailable. Failures are reported to stderr; the running helper queues events when the receiver is offline.
+
+## Herdr remotes
+
+Open **Settings > Remotes > Add Remote**. Enter an SSH alias or `user@host`, optionally a friendly name and Herdr session, then use **Test Connection** before saving. A blank session or `default` selects the default session. Named sessions accept letters, digits, `.`, `_`, and `-`.
+
+Herdr must be installed and running on the remote Mac or Linux host. The app uses `/usr/bin/ssh` and your existing SSH configuration; there is no local Python dependency and no remote SidePulse component. It probes the platform and checks executable candidates from PATH, Homebrew, Cargo, local/mise/Nix installations, and a previously detected path. An absolute **Herdr executable** override takes precedence. A compatible error response, such as a stopped Herdr session, proves the executable is installed without falsely reporting a working session.
+
+If SSH needs a password, key passphrase, or host-key confirmation, save and enable the remote, then select **Authenticate in Terminal**. Prompts remain in Terminal, not in SidePulse. The app resumes monitoring automatically after successful authentication. **Cancel Authentication**, disabling/removing the remote, and sleep cancel the attempt. Each attempt uses an independently owned, private SSH control socket; failed or unaccepted connections are closed.
+
+Connected remotes show their platform, detected Herdr path, agent count, and last successful update. Failures distinguish SSH/authentication problems, missing or stopped Herdr, invalid overrides, unsupported platforms, and incompatible responses. **Reconnect** retries one remote without interrupting the others. Renaming a remote does not restart SSH. Native preferences are independent; existing Python remote settings are not imported or changed.
+
+For a host on your local network, macOS may request Local Network access. If SSH works in Terminal but not in the app, check **System Settings > Privacy & Security > Local Network** for SidePulse Native.
+
+Each enabled remote uses a persistent SSH polling connection with a two-second interval. Working and blocked agents become **Working** and **Ask** in the same aggregation as local sessions. Only an observed active-to-settled transition becomes **Done**; startup, reconnect, and wake do not invent completions. Completion duration follows the Activity setting. Remote state expires after 15 seconds without an authoritative snapshot, and remote sessions are never persisted as local sessions. Monitoring pauses during system sleep and resumes with a new baseline on wake.
+
+To open the tab when launching an already-built app that is not running:
+
+```sh
+open "macos-native/dist/SidePulse Native.app" --args --copilot-testing --show-remotes
+```
 
 ## Features
 
@@ -71,7 +91,7 @@ The hook commands emit no permission decisions and remain non-blocking for Copil
 - Optional native status strip beneath the menu bar/notch.
 - IOKit battery information and process-scoped keep-awake policies, with a low-battery cutoff.
 - Optional in-process prevention of ordinary SidePulse Pro unmount/eject requests.
-- Optional Herdr remote monitoring over the macOS SSH client, with reconnects and Terminal-based authentication.
+- Optional Herdr remote monitoring over the macOS SSH client, with connection testing, compatible-binary discovery, bounded streams, reconnects, and cancellable Terminal authentication.
 - Opt-in launch at login using `SMAppService`.
 
 To receive real activity, open the app normally and explicitly install the desired provider's hooks from **Settings > Agent Hooks**. Restart that agent afterward. Codex may require approving the new hooks. Native installation preserves existing SidePulse hooks, so both apps can observe activity while comparing them. Keep only one app in control of a physical device.
@@ -96,7 +116,9 @@ This is a separate native implementation, not a complete migration of every lega
 ./macos-native/smoke-test.sh
 ```
 
-Core XCTest coverage includes event normalization, question detection, aggregation, permissions, expiry, hook preservation, Herdr transitions, native IPC, offline events, and LED write scheduling. Copilot coverage includes restricted-mode policy, dialog notifications, bounded transcript reads, compatible hook payloads, and a missing-helper fail-open case. The smoke script opens a relocated app bundle with isolated data and drives its bundled helper through the actual UI's Working / Ask / Done transitions, completion settling and expiry, window rendering, persistence, and offline replay. It also installs Copilot hooks in a fixture home, executes the actual generated commands, and removes them without modifying real agent configuration.
+Core XCTest coverage includes event normalization, question detection, aggregation, permissions, expiry, hook preservation, native IPC, offline events, and LED write scheduling. Copilot coverage includes restricted-mode policy, dialog notifications, bounded transcript reads, compatible hook payloads, and a missing-helper fail-open case. Herdr fixtures exercise strict protocol parsing, legacy and structured session references, remote-only agent types, discovery, stable completion timestamps, reconnect baselines, grace expiry, executable replacement, bounded stdout/stderr, cancellation under continuous output, and authentication acknowledgement/failure/cancellation.
+
+The smoke script opens a relocated app bundle with isolated data and drives its bundled helper through the actual UI's Working / Ask / Done transitions, completion settling and expiry, window rendering, persistence, and offline replay. It also installs Copilot hooks in a fixture home, executes the actual generated commands, and removes them without modifying real agent configuration. A separate bundled-app case uses two fake SSH remotes to exercise the live Remotes tab, selective reconfiguration, local Ask priority, sleep/wake, and shutdown. Its `--test-ssh` injection requires `--copilot-testing`, an explicit `--state-dir`, and a fixture executable inside that directory; it is not used by ordinary launches.
 
 For manual development events:
 

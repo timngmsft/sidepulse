@@ -25,8 +25,23 @@ public struct RemoteConfiguration: Codable, Identifiable, Equatable, Sendable {
     public var target = ""
     public var session = ""
     public var herdrPath = ""
+    public var resolvedHerdrPath: String?
     public var enabled = true
     public init() {}
+    public var displayName: String { name.isEmpty ? target : name }
+    public var normalizedSession: String { session == "default" ? "" : session }
+    public func sameEndpoint(as other: Self) -> Bool {
+        target == other.target && normalizedSession == other.normalizedSession && herdrPath == other.herdrPath
+    }
+    public func normalized() -> Self {
+        var copy = self
+        copy.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.target = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.session = session.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.session = copy.normalizedSession
+        copy.herdrPath = herdrPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return copy
+    }
     public func validate() throws {
         guard UUID(uuidString: id) != nil else { throw NativeError("Remote configuration has an invalid identifier.") }
         guard !target.isEmpty, !target.hasPrefix("-"),
@@ -34,8 +49,9 @@ public struct RemoteConfiguration: Codable, Identifiable, Equatable, Sendable {
               target.rangeOfCharacter(from: .controlCharacters) == nil else {
             throw NativeError("Enter an SSH alias or user@host, without spaces or command options.")
         }
-        guard session.rangeOfCharacter(from: .controlCharacters) == nil else {
-            throw NativeError("Remote session names cannot contain control characters.")
+        guard session.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) ||
+            (48...57).contains($0) || [45, 46, 95].contains($0) }) else {
+            throw NativeError("Herdr session names may contain only letters, numbers, '.', '_', and '-'.")
         }
         guard herdrPath.isEmpty || (herdrPath.hasPrefix("/") &&
               herdrPath.rangeOfCharacter(from: .controlCharacters) == nil) else {

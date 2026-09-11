@@ -72,8 +72,8 @@ struct DashboardView: View {
                             HStack {
                                 Image(systemName: "network")
                                 VStack(alignment: .leading) {
-                                    Text(remote.name.isEmpty ? remote.target : remote.name).font(.caption.weight(.medium))
-                                    Text(remote.enabled ? (model.remoteStatus[remote.id] ?? "Connecting") : "Disabled")
+                                    Text(remote.displayName).font(.caption.weight(.medium))
+                                    Text(model.remoteStatus[remote.id]?.summary ?? "Disabled")
                                         .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                                 }
                                 Spacer()
@@ -123,8 +123,12 @@ private struct SessionRow: View {
                 Text(session.title).font(.callout.weight(.semibold)).lineLimit(1)
                     .help(session.cwd ?? session.title)
                 HStack {
-                    Text(session.provider.title)
-                    if session.remoteID != nil { Image(systemName: "network") }
+                    Text(session.providerTitle)
+                    if let remoteID = session.remoteID,
+                       let remote = model.configuration.remotes.first(where: { $0.id == remoteID }) {
+                        Image(systemName: "network")
+                        Text("\(remote.displayName) via Herdr").lineLimit(1)
+                    }
                     Text("· \(session.statusLabel)")
                 }.font(.caption).foregroundStyle(.secondary)
                 HStack(spacing: 4) {
@@ -144,8 +148,13 @@ private struct SessionRow: View {
                 if session.remoteID == nil {
                     Button("Open Workspace") { model.openSession(session) }
                     Button("Open Terminal Here") { model.openTerminal(session) }
+                    Button("Dismiss Session") { model.forget(session) }
+                } else {
+                    Button("Remote Settings...") {
+                        model.settingsSection = .remotes
+                        model.showSettings?()
+                    }
                 }
-                Button("Dismiss Session") { model.forget(session) }
             } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 24)
         }.padding(11).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
             .accessibilityElement(children: .contain)
@@ -235,7 +244,7 @@ struct SettingsView: View {
         Form {
             Section {
                 Text("Agent hooks call a small bundled native executable. Neither Python nor the existing sidepulse command is used.")
-                ForEach(Provider.allCases) { provider in
+                ForEach(Provider.hookProviders) { provider in
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(provider.title).font(.headline)
@@ -262,8 +271,8 @@ struct SettingsView: View {
                 }
                 Text("Existing hooks are preserved. Configurations are backed up before changes. Restart the agent after installing; Codex may ask you to approve the new hooks.")
                     .font(.caption).foregroundStyle(.secondary)
-                if model.mode.permitsHookChanges(for: .copilot) {
-                    Text("Copilot configuration: \(HookConfiguration.file(for: .copilot, home: FileManager.default.homeDirectoryForCurrentUser).path)")
+                if model.mode.permitsHookChanges(for: .copilot), let file = model.hookFiles[.copilot] {
+                    Text("Copilot configuration: \(file.path)")
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
             }
@@ -342,7 +351,7 @@ struct RemotesView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Herdr remotes").font(.title2.weight(.semibold))
-            Text("Uses macOS SSH and your existing SSH configuration. No SidePulse software is installed on the remote.")
+            Text("Monitor Herdr agents on a Mac or Linux host using your existing SSH configuration. Herdr must be installed and running there; no Python or remote SidePulse installation is needed.")
                 .font(.callout).foregroundStyle(.secondary)
             ScrollView {
                 VStack(spacing: 12) {
@@ -350,16 +359,22 @@ struct RemotesView: View {
                         GroupBox {
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
-                                    Text(remote.name.isEmpty ? remote.target : remote.name).font(.headline)
+                                    Text(remote.displayName).font(.headline)
                                     Spacer()
                                     Button("Edit") { editing = remote }
                                     Button("Remove") { model.update { $0.remotes.removeAll { $0.id == remote.id } } }
                                 }
-                                Text(remote.target).font(.system(.caption, design: .monospaced))
-                                Text(remote.enabled ? model.remoteStatus[remote.id] ?? "Connecting" : "Disabled")
-                                    .font(.caption).foregroundStyle(.secondary)
+                                Text(remote.target + (remote.normalizedSession.isEmpty ? "" : " / \(remote.normalizedSession)"))
+                                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                                RemoteConnectionDetail(connection: model.remoteStatus[remote.id] ?? HerdrConnectionStatus(.disabled))
                                 HStack {
-                                    Button("Authenticate in Terminal") { model.authenticate(remote) }
+                                    if model.remoteStatus[remote.id]?.state == .authenticating {
+                                        Button("Cancel Authentication") { model.cancelAuthentication(remote.id) }
+                                    } else {
+                                        Button("Authenticate in Terminal") { model.authenticate(remote) }.disabled(!remote.enabled)
+                                        Button("Reconnect") { model.retryRemote(remote) }.disabled(!remote.enabled)
+                                    }
+                                    Spacer()
                                     Button(remote.enabled ? "Disable" : "Enable") {
                                         model.update { config in
                                             if let index = config.remotes.firstIndex(where: { $0.id == remote.id }) {
@@ -371,15 +386,24 @@ struct RemotesView: View {
                             }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
                         }
                     }
+                    if model.configuration.remotes.isEmpty {
+                        VStack(spacing: 12) {
+                            Image(systemName: "network").font(.system(size: 30)).foregroundStyle(.secondary)
+                            Text("Keep remote work in the same status bar").font(.headline)
+                            Text("Add an SSH alias or user@host, then test the connection before saving.")
+                                .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        }.frame(maxWidth: .infinity).padding(.vertical, 35)
+                    }
                 }
             }
             HStack {
                 Button("Add Remote") { editing = RemoteConfiguration() }
-                Button("Reconnect") { model.retryRemotes() }
+                    .buttonStyle(.borderedProminent).accessibilityIdentifier("add-herdr-remote")
                 Spacer()
+                Text("Working / Ask / Done match local agents.").font(.caption).foregroundStyle(.secondary)
             }
         }.padding(18).sheet(item: $editing) { remote in
-            RemoteEditor(remote: remote) { result in
+            RemoteEditor(model: model, remote: remote) { result in
                 model.update { config in
                     if let index = config.remotes.firstIndex(where: { $0.id == result.id }) { config.remotes[index] = result }
                     else { config.remotes.append(result) }
@@ -391,9 +415,12 @@ struct RemotesView: View {
 
 private struct RemoteEditor: View {
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: AppModel
     @State var remote: RemoteConfiguration
     @State private var error: String?
-    let save: (RemoteConfiguration) -> Void
+    @State private var testStatus: HerdrConnectionStatus?
+    @State private var testing = false
+    let save: (RemoteConfiguration) -> Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Herdr Remote").font(.title2.weight(.semibold))
@@ -404,16 +431,89 @@ private struct RemoteEditor: View {
                 TextField("Herdr executable", text: $remote.herdrPath, prompt: Text("Auto-discover"))
                 Toggle("Enabled", isOn: $remote.enabled)
             }
+            Text("Leave the session blank for Herdr's default. Leave the executable blank to discover a compatible installation automatically.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let testStatus {
+                RemoteConnectionDetail(connection: testStatus)
+                if testStatus.state == .authenticationRequired {
+                    Text("Save this remote, then use Authenticate in Terminal to handle credentials or host-key confirmation.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             if let error { Text(error).font(.caption).foregroundStyle(.red) }
             HStack {
+                if testing {
+                    Button("Cancel Test") {
+                        model.cancelRemoteTest()
+                        testing = false; testStatus = nil
+                    }
+                } else {
+                    Button("Test Connection") {
+                        error = nil; testing = true
+                        model.testRemote(remote) { status, finished in
+                            testStatus = status; testing = !finished
+                        }
+                    }.disabled(remote.target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    do { try remote.validate(); save(remote); dismiss() }
+                    do {
+                        var result = remote.normalized()
+                        try result.validate()
+                        let existing = model.configuration.remotes.first { $0.id == result.id }
+                        if existing?.sameEndpoint(as: result) != true { result.resolvedHerdrPath = nil }
+                        if let path = testStatus?.path { result.resolvedHerdrPath = path }
+                        if save(result) { dismiss() }
+                        else { error = model.notice ?? "Could not save the remote." }
+                    }
                     catch { self.error = error.localizedDescription }
                 }.keyboardShortcut(.defaultAction)
             }
-        }.padding(24).frame(width: 440)
+        }.padding(24).frame(width: 520)
+            .onChange(of: remote) { _ in
+                model.cancelRemoteTest()
+                testing = false; testStatus = nil; error = nil
+            }
+            .onDisappear { model.cancelRemoteTest() }
+    }
+}
+
+private struct RemoteConnectionDetail: View {
+    let connection: HerdrConnectionStatus
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 7) {
+                if connection.state.isBusy { ProgressView().controlSize(.small) }
+                else {
+                    Image(systemName: connection.state == .connected ? "checkmark.circle.fill" :
+                            connection.state.isError ? "exclamationmark.triangle.fill" : "circle")
+                        .foregroundStyle(connection.state == .connected ? Color.green :
+                                            connection.state.isError ? Color.orange : Color.secondary)
+                }
+                Text(connection.summary).font(.callout.weight(.medium))
+            }
+            if !connection.message.isEmpty {
+                Text(connection.message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let path = connection.path {
+                Text("Herdr: \(path)").font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            HStack(spacing: 5) {
+                if let platform = connection.platform { Text(platform == "Darwin" ? "macOS" : platform) }
+                if let date = connection.lastSuccess {
+                    if connection.platform != nil { Text("·") }
+                    Text("Last update")
+                    Text(date, style: .relative).help(date.formatted())
+                }
+                if let retry = connection.retryAt {
+                    Text("· Retry")
+                    Text(retry, style: .relative)
+                }
+            }.font(.caption).foregroundStyle(.secondary)
+        }.accessibilityIdentifier("herdr-connection-\(connection.state.rawValue)")
     }
 }
 

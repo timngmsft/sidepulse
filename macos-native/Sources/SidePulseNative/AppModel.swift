@@ -11,8 +11,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var battery: BatteryState?
     @Published private(set) var history: [HistoryEntry] = []
     @Published var notice: String?
-    @Published var remoteStatus: [String: String] = [:]
+    @Published private(set) var remoteStatus: [String: HerdrConnectionStatus] = [:]
     @Published var installedHooks: [Provider: Bool] = [:]
+    @Published private(set) var hookFiles: [Provider: URL] = [:]
     @Published private(set) var keepingAwake = false
     @Published var settingsSection = SettingsSection.general
     let paths: NativePaths
@@ -26,8 +27,14 @@ final class AppModel: ObservableObject {
     private var tickTimer: Timer?
     private var batteryTimer: Timer?
     private var observers: [NSObjectProtocol] = []
-    private var remoteWorkers: [String: RemoteWorker] = [:]
-    private var remoteGeneration = 0
+    private var remoteWorkers: [String: HerdrMonitor] = [:]
+    private var remoteGenerations: [String: UUID] = [:]
+    private var remoteControlPaths: [String: URL] = [:]
+    private var remoteAuthentications: [String: HerdrAuthentication] = [:]
+    private var retiredAuthentications: [String: HerdrAuthentication] = [:]
+    private var remoteTest: HerdrMonitor?
+    private var remoteTestToken: UUID?
+    private let testSSHExecutable: URL?
     private var sleeping = false
     private var quitting = false
     private var lastHistory = Date.distantPast
@@ -36,8 +43,9 @@ final class AppModel: ObservableObject {
     var renderDiagnostics: (() -> [String: JSONValue])?
     var captureWindow: ((String) throws -> URL)?
 
-    init(paths: NativePaths, mode: ApplicationMode) throws {
+    init(paths: NativePaths, mode: ApplicationMode, testSSHExecutable: URL? = nil) throws {
         self.paths = paths; self.mode = mode
+        self.testSSHExecutable = testSSHExecutable
         try paths.prepare()
         let loaded = try Persistence.load(AppConfiguration.self, from: paths.configuration) ?? AppConfiguration()
         try loaded.validate()
@@ -70,7 +78,7 @@ final class AppModel: ObservableObject {
         refreshHooks()
         refreshDevices()
         refreshBattery()
-        restartRemotes()
+        synchronizeRemotes()
         applyServices()
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification] {
@@ -85,7 +93,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.systemWake() }
         })
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.drainPendingEvents(); self?.refresh() }
+            Task { @MainActor in self?.drainPendingEvents(); self?.checkAuthentications(); self?.refresh() }
         }
         tickTimer?.tolerance = 0.2
         if let tickTimer { RunLoop.main.add(tickTimer, forMode: .common) }
@@ -104,6 +112,9 @@ final class AppModel: ObservableObject {
         server?.stop(); server = nil
         for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         observers.removeAll()
+        cancelRemoteTest()
+        for id in Array(remoteAuthentications.keys) { cancelAuthentication(id, reconnect: false) }
+        remoteGenerations.removeAll()
         for worker in remoteWorkers.values { worker.stop() }
         remoteWorkers.removeAll()
         do {
@@ -114,7 +125,8 @@ final class AppModel: ObservableObject {
         } catch { log(error.localizedDescription) }
     }
 
-    func update(_ change: (inout AppConfiguration) -> Void) {
+    @discardableResult
+    func update(_ change: (inout AppConfiguration) -> Void) -> Bool {
         var next = configuration
         change(&next)
         do {
@@ -124,10 +136,12 @@ final class AppModel: ObservableObject {
             configuration = next
             store.staleAfter = next.staleAfterSeconds
             store.doneVisible = next.doneVisibleSeconds
-            if remotesChanged { restartRemotes() }
+            if remotesChanged { synchronizeRemotes() }
+            for worker in remoteWorkers.values { worker.setCompletionDuration(next.doneVisibleSeconds) }
             applyServices()
             refresh()
-        } catch { report(error.localizedDescription) }
+            return true
+        } catch { report(error.localizedDescription); return false }
     }
 
     func setLogin(_ enabled: Bool) {
@@ -147,7 +161,7 @@ final class AppModel: ObservableObject {
             report(mode.explanation ?? "Hook installation is unavailable in this mode.")
             return
         }
-        let file = HookConfiguration.file(for: provider, home: FileManager.default.homeDirectoryForCurrentUser)
+        guard let file = hookFiles[provider] else { report("The hook configuration path is not available."); return }
         let alert = NSAlert()
         alert.messageText = removing ? "Remove native \(provider.title) hooks?" : "Install native \(provider.title) hooks?"
         alert.informativeText = "Configuration: \(file.path)\n\nOnly SidePulse Native entries will be changed. Other hooks are preserved and existing configuration is backed up first. Restart the agent afterward."
@@ -164,8 +178,11 @@ final class AppModel: ObservableObject {
     }
 
     func refreshHooks() {
-        for provider in Provider.allCases where mode != .copilotTesting || provider == .copilot {
-            installedHooks[provider] = HookConfiguration.isInstalled(provider: provider, home: FileManager.default.homeDirectoryForCurrentUser)
+        for provider in Provider.hookProviders where mode != .copilotTesting || provider == .copilot {
+            do {
+                hookFiles[provider] = try HookConfiguration.file(for: provider, home: FileManager.default.homeDirectoryForCurrentUser)
+                installedHooks[provider] = HookConfiguration.isInstalled(provider: provider, home: FileManager.default.homeDirectoryForCurrentUser)
+            } catch { report(error.localizedDescription) }
         }
     }
 
@@ -212,13 +229,81 @@ final class AppModel: ObservableObject {
     }
 
     func authenticate(_ remote: RemoteConfiguration) {
-        guard mode.permitsRemotes else { report("Remote connections are disabled during Copilot-only testing."); return }
-        let control = controlPath(for: remote)
-        let command = "/usr/bin/ssh -M -S \(HookConfiguration.shellQuote(control.path)) -o ControlPersist=600 -fN -- \(HookConfiguration.shellQuote(remote.target))"
-        openCommand(command + "\nprintf '\\nAuthentication finished. You can close this window.\\n'", name: "authenticate-\(remote.id)")
+        guard mode.permitsRemotes, !sleeping, remote.enabled,
+              configuration.remotes.contains(where: { $0.id == remote.id && $0.sameEndpoint(as: remote) }) else {
+            report("Enable and save the remote before authenticating."); return
+        }
+        cancelAuthentication(remote.id, reconnect: false)
+        retireRemote(remote.id)
+        do {
+            let attempt = try HerdrAuthentication(remote: remote, root: paths.root,
+                                                  controlPath: HerdrCommands.controlPath(root: paths.root, remote: remote),
+                                                  executable: testSSHExecutable ?? URL(fileURLWithPath: "/usr/bin/ssh"))
+            remoteAuthentications[remote.id] = attempt
+            remoteStatus[remote.id] = HerdrConnectionStatus(.authenticating, message: "Credentials and host-key prompts stay in Terminal.")
+            NSWorkspace.shared.open([attempt.command],
+                                    withApplicationAt: URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"),
+                                    configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, error in
+                guard let error else { return }
+                Task { @MainActor in
+                    guard let self, self.remoteAuthentications[remote.id]?.token == attempt.token else { return }
+                    self.cancelAuthentication(remote.id, reconnect: false)
+                    self.remoteStatus[remote.id] = HerdrConnectionStatus(.remoteError, message: error.localizedDescription)
+                    self.report("Could not open SSH authentication: \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            remoteStatus[remote.id] = HerdrConnectionStatus(.remoteError, message: error.localizedDescription)
+            report(error.localizedDescription)
+        }
     }
 
-    func retryRemotes() { restartRemotes() }
+    func retryRemote(_ remote: RemoteConfiguration) {
+        cancelAuthentication(remote.id, reconnect: false)
+        retireRemote(remote.id)
+        synchronizeRemotes()
+    }
+
+    func testRemote(_ draft: RemoteConfiguration, completion: @escaping (HerdrConnectionStatus, Bool) -> Void) {
+        cancelRemoteTest()
+        guard mode.permitsRemotes, !sleeping else {
+            completion(HerdrConnectionStatus(.disabled, message: "Remote connections are unavailable in this mode."), true); return
+        }
+        let remote = draft.normalized()
+        do { try remote.validate() }
+        catch { completion(HerdrConnectionStatus(.remoteError, message: error.localizedDescription), true); return }
+        let saved = configuration.remotes.first { $0.id == remote.id && $0.sameEndpoint(as: remote) }
+        let existing = saved.flatMap { remoteControlPaths[$0.id] }
+        let control = existing ?? HerdrCommands.controlPath(root: paths.root, remote: remote)
+        let token = UUID()
+        remoteTestToken = token
+        let worker = HerdrMonitor(configuration: remote, controlPath: control, once: true, ownsControl: existing == nil,
+                                  executable: testSSHExecutable ?? URL(fileURLWithPath: "/usr/bin/ssh"),
+                                  log: remoteLogger) { [weak self] update in
+            guard let self, self.remoteTestToken == token, !self.quitting else { return }
+            completion(update.connection, update.finished)
+            if update.finished { self.cancelRemoteTest() }
+        }
+        remoteTest = worker
+        worker.start()
+    }
+
+    func cancelRemoteTest() {
+        remoteTestToken = nil
+        remoteTest?.stop(); remoteTest = nil
+    }
+
+    func cancelAuthentication(_ id: String, reconnect: Bool = true) {
+        guard let attempt = remoteAuthentications.removeValue(forKey: id) else { return }
+        do { try attempt.cancel() }
+        catch { report("Could not cancel SSH authentication: \(error.localizedDescription)") }
+        closeAuthenticationControl(attempt)
+        retiredAuthentications[attempt.token] = attempt
+        if reconnect {
+            notice = "Authentication cancelled. The Terminal window can be closed."
+            synchronizeRemotes()
+        }
+    }
 
     func exportHistory() {
         let panel = NSSavePanel()
@@ -259,10 +344,20 @@ final class AppModel: ObservableObject {
                         ($0.rawValue, .bool(mode.permitsHookChanges(for: $0)))
                     }))
                     object["systemChangesAllowed"] = .bool(!mode.restrictsSystemChanges)
+                    object["remotesAllowed"] = .bool(mode.permitsRemotes)
+                    object["remotes"] = try JSONDecoder().decode(JSONValue.self, from: JSONCoding.encoder().encode(remoteStatus))
                     object["ok"] = .bool(true)
                     return try JSONEncoder().encode(JSONValue.object(object))
                 case "clear" where development:
                     clearSessions()
+                case "set-test-remotes" where testSSHExecutable != nil:
+                    guard let remotes = value["remotes"] else { throw NativeError("Missing test remotes.") }
+                    let decoded = try JSONDecoder().decode([RemoteConfiguration].self, from: JSONEncoder().encode(remotes))
+                    guard update({ $0.remotes = decoded }) else { throw NativeError("Could not save test remotes.") }
+                case "test-sleep" where testSSHExecutable != nil:
+                    systemSleep()
+                case "test-wake" where testSSHExecutable != nil:
+                    systemWake()
                 case _ where development && ["capture", "capture-settings", "capture-history", "capture-status",
                                                "capture-hooks", "capture-devices", "capture-remotes"].contains(action):
                     guard let captureWindow else { throw NativeError("Window capture is not available.") }
@@ -377,35 +472,131 @@ final class AppModel: ObservableObject {
         devicesService.apply(devices: devices, programs: programs, force: force)
     }
 
-    private func restartRemotes() {
-        remoteGeneration += 1
-        let generation = remoteGeneration
-        for id in remoteWorkers.keys { store.reconcile(remoteID: id, sessions: []) }
-        for worker in remoteWorkers.values { worker.stop() }
-        remoteWorkers.removeAll()
-        remoteStatus.removeAll()
-        for remote in configuration.remotes where remote.enabled && mode.permitsRemotes {
-            let worker = RemoteWorker(configuration: remote, controlPath: controlPath(for: remote)) { [weak self] sessions, error in
-                guard let self, !self.quitting, self.remoteGeneration == generation else { return }
-                self.remoteStatus[remote.id] = error ?? "Connected"
-                if let sessions { self.store.reconcile(remoteID: remote.id, sessions: sessions); self.refresh() }
+    private var remoteLogger: (String) -> Void {
+        { [weak self] message in DispatchQueue.main.async { self?.log(message) } }
+    }
+
+    private func synchronizeRemotes() {
+        for id in Array(remoteWorkers.keys) {
+            let saved = configuration.remotes.first { $0.id == id }
+            let matches = saved.map { $0.enabled && remoteWorkers[id]?.configuration.sameEndpoint(as: $0) == true } ?? false
+            if !mode.permitsRemotes || sleeping || !matches { retireRemote(id) }
+        }
+        for (id, attempt) in remoteAuthentications {
+            if !configuration.remotes.contains(where: { $0.id == id && $0.enabled && $0.sameEndpoint(as: attempt.remote) }) {
+                cancelAuthentication(id, reconnect: false)
             }
-            remoteWorkers[remote.id] = worker
-            worker.start()
+        }
+        remoteStatus = remoteStatus.filter { id, _ in configuration.remotes.contains { $0.id == id } }
+        for remote in configuration.remotes {
+            if !remote.enabled || !mode.permitsRemotes { remoteStatus[remote.id] = HerdrConnectionStatus(.disabled) }
+            else if sleeping { remoteStatus[remote.id] = HerdrConnectionStatus(.paused) }
+            else if remoteWorkers[remote.id] == nil && remoteAuthentications[remote.id] == nil { startRemote(remote) }
         }
         refresh()
     }
 
-    private func controlPath(for remote: RemoteConfiguration) -> URL {
-        paths.socket.deletingLastPathComponent().appendingPathComponent("ssh-\(remote.id.prefix(12))")
+    private func startRemote(_ remote: RemoteConfiguration, controlPath: URL? = nil) {
+        let token = UUID()
+        remoteGenerations[remote.id] = token
+        let control = controlPath ?? HerdrCommands.controlPath(root: paths.root, remote: remote)
+        remoteControlPaths[remote.id] = control
+        remoteStatus[remote.id] = HerdrConnectionStatus(.connecting)
+        let worker = HerdrMonitor(configuration: remote, controlPath: control,
+                                  executable: testSSHExecutable ?? URL(fileURLWithPath: "/usr/bin/ssh"),
+                                  log: remoteLogger) { [weak self] update in
+            guard let self, !self.quitting, self.remoteGenerations[remote.id] == token else { return }
+            if self.remoteStatus[remote.id] != update.connection { self.remoteStatus[remote.id] = update.connection }
+            self.remoteControlPaths[remote.id] = update.controlPath
+            if let path = update.connection.path,
+               let index = self.configuration.remotes.firstIndex(where: { $0.id == remote.id }),
+               self.configuration.remotes[index].resolvedHerdrPath != path {
+                var next = self.configuration
+                next.remotes[index].resolvedHerdrPath = path
+                do {
+                    try Persistence.save(next, to: self.paths.configuration)
+                    self.configuration = next
+                } catch { self.report("Could not save detected Herdr path: \(error.localizedDescription)") }
+            }
+            if let sessions = update.sessions {
+                self.store.reconcile(remoteID: remote.id, sessions: sessions)
+                self.refresh()
+            }
+        }
+        remoteWorkers[remote.id] = worker
+        worker.setCompletionDuration(configuration.doneVisibleSeconds)
+        worker.start()
+    }
+
+    private func retireRemote(_ id: String) {
+        remoteGenerations.removeValue(forKey: id)
+        remoteControlPaths.removeValue(forKey: id)
+        remoteWorkers.removeValue(forKey: id)?.stop()
+        store.reconcile(remoteID: id, sessions: [])
+    }
+
+    private func checkAuthentications() {
+        for (id, attempt) in remoteAuthentications {
+            do {
+                guard ProcessInfo.processInfo.systemUptime - attempt.startedAt < 660 else {
+                    throw NativeError("SSH authentication timed out.")
+                }
+                if let code = try attempt.exitStatus() {
+                    guard code == 0 else {
+                        cancelAuthentication(id, reconnect: false)
+                        remoteStatus[id] = HerdrConnectionStatus(.authenticationRequired, message: "SSH authentication exited with status \(code). See Terminal for details.")
+                        continue
+                    }
+                    guard let saved = configuration.remotes.first(where: {
+                        $0.id == id && $0.enabled && $0.sameEndpoint(as: attempt.remote)
+                    }), !sleeping, !quitting else {
+                        cancelAuthentication(id, reconnect: false); continue
+                    }
+                    if !FileManager.default.fileExists(atPath: attempt.accepted.path) {
+                        if !FileManager.default.fileExists(atPath: attempt.acknowledgement.path) {
+                            try attempt.acknowledge()
+                        } else if FileManager.default.fileExists(atPath: attempt.finished.path) {
+                            throw NativeError("The SSH connection was not accepted in time. Authenticate again.")
+                        }
+                        continue
+                    }
+                    remoteAuthentications.removeValue(forKey: id)
+                    retiredAuthentications[attempt.token] = attempt
+                    startRemote(saved, controlPath: attempt.controlPath)
+                } else if ProcessInfo.processInfo.systemUptime - attempt.startedAt >= 600 {
+                    cancelAuthentication(id, reconnect: false)
+                    remoteStatus[id] = HerdrConnectionStatus(.authenticationRequired, message: "SSH authentication timed out.")
+                }
+            } catch {
+                cancelAuthentication(id, reconnect: false)
+                remoteStatus[id] = HerdrConnectionStatus(.remoteError, message: error.localizedDescription)
+                report(error.localizedDescription)
+            }
+        }
+        for (token, attempt) in retiredAuthentications where FileManager.default.fileExists(atPath: attempt.finished.path) {
+            do {
+                if FileManager.default.fileExists(atPath: attempt.cancellation.path) { closeAuthenticationControl(attempt) }
+                try attempt.removeFiles()
+                retiredAuthentications.removeValue(forKey: token)
+            } catch { report("Could not remove SSH authentication files: \(error.localizedDescription)") }
+        }
+    }
+
+    private func closeAuthenticationControl(_ attempt: HerdrAuthentication) {
+        HerdrControlConnection.close(remote: attempt.remote, path: attempt.controlPath,
+                                     executable: testSSHExecutable ?? URL(fileURLWithPath: "/usr/bin/ssh"), log: remoteLogger)
     }
 
     private func systemSleep() {
         sleeping = true
+        cancelRemoteTest()
+        for id in Array(remoteAuthentications.keys) { cancelAuthentication(id, reconnect: false) }
+        synchronizeRemotes()
         applyServices()
     }
     private func systemWake() {
         sleeping = false
+        synchronizeRemotes()
         refreshBattery(); refreshDevices(); refresh()
     }
 

@@ -14,6 +14,7 @@
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSRemovableVolumesUsageDescription</key><string>SidePulse Native writes LED programs to the SidePulse devices you explicitly enable.</string>
+    <key>NSLocalNetworkUsageDescription</key><string>SidePulse Native connects to the SSH hosts you configure to read remote Herdr agent status.</string>
     <key>NSHumanReadableCopyright</key><string>SidePulse contributors. MIT License.</string>
 </dict>
 </plist>

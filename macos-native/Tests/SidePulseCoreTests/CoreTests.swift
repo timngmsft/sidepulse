@@ -15,7 +15,7 @@ final class CoreTests: XCTestCase {
     }
 
     func testProviderAliasesAndQuestionDetection() throws {
-        for provider in Provider.allCases {
+        for provider in Provider.hookProviders {
             let value = try EventNormalizer.normalize(HookEnvelope(provider: provider, line: .object([
                 "hookEventName": .string("userPromptSubmitted"), "sessionId": .string("123"),
                 "cwd": .string("/work/native")
@@ -121,7 +121,7 @@ final class CoreTests: XCTestCase {
     func testHooksPreserveOtherCommandsAndAreIdempotent() throws {
         let helper = URL(fileURLWithPath: "/Applications/SidePulse Native.app/Contents/Helpers/SidePulseHook")
         let socket = URL(fileURLWithPath: "/tmp/native/events.sock")
-        for provider in Provider.allCases {
+        for provider in Provider.hookProviders {
             let original = provider == .codex
                 ? "model = \"example\"\n[features]\nhooks = false\nother = true\n"
                 : #"{"other":true,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"original-hook"}]}]}}"#
@@ -174,7 +174,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try reducer.apply(payload("done"), remote: remote, at: now.addingTimeInterval(2)).first?.updatedAt, finished?.updatedAt)
         XCTAssertThrowsError(try reducer.apply(Data("{}".utf8), remote: remote))
         remote.target = "-oProxyCommand=bad"
-        XCTAssertThrowsError(try HerdrReducer.command(for: remote))
+        XCTAssertThrowsError(try HerdrCommands.agentList(path: "/usr/bin/herdr", remote: remote, polling: true))
     }
 
     func testOfflineEventsArePrivateAndIsolated() throws {
@@ -280,7 +280,7 @@ final class CoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let helper = URL(fileURLWithPath: "/usr/bin/true")
         let socket = root.appendingPathComponent("events.sock")
-        let file = HookConfiguration.file(for: .claude, home: root)
+        let file = try HookConfiguration.file(for: .claude, home: root)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         let target = root.appendingPathComponent("shared-settings.json")
         let original = Data(#"{"unrelated":"preserve me"}"#.utf8)

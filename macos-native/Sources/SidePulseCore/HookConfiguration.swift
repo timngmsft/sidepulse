@@ -9,7 +9,7 @@ public enum HookConfiguration {
     public static let markerStart = "# >>> sidepulse-native hooks >>>"
     public static let markerEnd = "# <<< sidepulse-native hooks <<<"
 
-    public static func file(for provider: Provider, home: URL) -> URL {
+    public static func file(for provider: Provider, home: URL) throws -> URL {
         switch provider {
         case .codex: return home.appendingPathComponent(".codex/config.toml")
         case .claude: return home.appendingPathComponent(".claude/settings.json")
@@ -20,10 +20,12 @@ public enum HookConfiguration {
                 .map { URL(fileURLWithPath: $0) } ?? home.appendingPathComponent(".copilot")
             return root.appendingPathComponent("hooks/sidepulse-native.json")
         case .grok: return home.appendingPathComponent(".grok/hooks/sidepulse-native.json")
+        case .herdr: throw NativeError("Herdr agents are monitored remotely and do not use local hooks.")
         }
     }
 
     public static func command(provider: Provider, helper: URL, socket: URL, event: String? = nil) throws -> String {
+        guard provider.supportsHooks else { throw NativeError("Herdr agents do not use local hooks.") }
         for path in [helper.path, socket.path] {
             guard path.rangeOfCharacter(from: .controlCharacters) == nil else {
                 throw NativeError("Hook paths cannot contain control characters.")
@@ -115,7 +117,7 @@ public enum HookConfiguration {
         guard FileManager.default.isExecutableFile(atPath: helper.path) else {
             throw NativeError("The bundled native hook helper is missing. Build the .app bundle first.")
         }
-        let file = file(for: provider, home: home)
+        let file = try file(for: provider, home: home)
         let destination = file.resolvingSymlinksInPath()
         let exists = FileManager.default.fileExists(atPath: destination.path)
         if removing && !exists { return HookInstallResult(file: file, backup: nil) }
@@ -170,6 +172,7 @@ public enum HookConfiguration {
                     "PermissionRequest", "Notification", "PreCompact", "PostCompact", "SubagentStop", "Stop", "SessionEnd"]
         case .grok:
             return EventNormalizer.events.filter { $0 != "PermissionRequest" && $0 != "ErrorOccurred" }
+        case .herdr: return []
         }
     }
 

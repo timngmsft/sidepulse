@@ -60,7 +60,9 @@ public extension Dictionary where Key == String, Value == JSONValue {
 }
 
 public enum Provider: String, Codable, CaseIterable, Identifiable, Sendable {
-    case codex, claude, copilot, grok
+    case codex, claude, copilot, grok, herdr
+    public static let hookProviders: [Provider] = [.codex, .claude, .copilot, .grok]
+    public var supportsHooks: Bool { Self.hookProviders.contains(self) }
     public var id: String { rawValue }
     public var title: String {
         switch self {
@@ -68,6 +70,7 @@ public enum Provider: String, Codable, CaseIterable, Identifiable, Sendable {
         case .claude: return "Claude"
         case .copilot: return "GitHub Copilot"
         case .grok: return "Grok"
+        case .herdr: return "Herdr agent"
         }
     }
 }
@@ -137,6 +140,8 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
     public var message: String?
     public var tool: String?
     public var remoteID: String?
+    public var remoteAgentName: String?
+    public var remoteTerminalID: String?
     public var pendingPermissions: Set<String> = []
 
     public init(id: String, provider: Provider, sessionID: String? = nil, title: String,
@@ -149,13 +154,16 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
     }
 
     public func effectiveMode(at now: Date, staleAfter: TimeInterval, doneVisible: TimeInterval) -> AgentMode {
-        let timeout = remoteID == nil ? staleAfter : 20
+        let timeout = remoteID == nil ? staleAfter : HerdrReducer.graceSeconds
         if now.timeIntervalSince(observedAt) > timeout { return .idle }
+        if remoteID != nil && (mode == .waiting || mode == .blocked) &&
+            now.timeIntervalSince(updatedAt) > staleAfter { return .idle }
         if mode == .completed && now.timeIntervalSince(updatedAt) > doneVisible { return .idle }
         return mode
     }
 
     public var statusLabel: String { event == "SessionEnd" ? "Ended" : mode.display.rawValue }
+    public var providerTitle: String { provider == .herdr ? remoteAgentName ?? provider.title : provider.title }
 
     public var referenceLabel: String? {
         let agentPrefix = "\(provider.rawValue):agent:"
@@ -163,6 +171,7 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
             return "Agent \(id.dropFirst(agentPrefix.count).prefix(8))"
         }
         return sessionID.map { "Session \($0.prefix(8))" }
+            ?? remoteTerminalID.map { "Terminal \($0.prefix(12))" }
     }
 }
 

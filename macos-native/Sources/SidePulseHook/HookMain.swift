@@ -20,7 +20,7 @@ enum HookMain {
                     "action": .string(value("--request") ?? (args.contains("--snapshot") ? "snapshot" : "ping"))
                 ]))
             } else {
-                guard let name = value("--provider"), let provider = Provider(rawValue: name) else {
+                guard let name = value("--provider"), let provider = Provider(rawValue: name), provider.supportsHooks else {
                     throw NativeError("Usage: SidePulseHook --provider codex|claude|copilot|grok [--socket PATH]")
                 }
                 var input = Data()

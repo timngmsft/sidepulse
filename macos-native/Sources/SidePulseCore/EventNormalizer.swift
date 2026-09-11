@@ -26,6 +26,7 @@ public enum EventNormalizer {
     ]
 
     public static func normalize(_ envelope: HookEnvelope, receivedAt now: Date = Date()) throws -> NormalizedEvent {
+        guard envelope.provider.supportsHooks else { throw NativeError("Herdr activity must come from a remote monitor, not a local hook.") }
         guard let outer = envelope.line.object else { throw NativeError("Hook payload must be a JSON object.") }
         let raw = outer["event"]?.object ?? outer
         guard let eventText = raw.text("hook_event_name", "hookEventName", "event_name", "eventName", "type") else {

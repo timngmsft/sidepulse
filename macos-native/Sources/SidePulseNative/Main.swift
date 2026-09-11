@@ -33,7 +33,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let firstLaunch = !FileManager.default.fileExists(atPath: paths.configuration.path)
             let mode: ApplicationMode = args.contains("--copilot-testing") ? .copilotTesting :
                 args.contains("--development") ? .preview : .standard
-            let model = try AppModel(paths: paths, mode: mode)
+            let testSSH: URL?
+            if let index = args.firstIndex(of: "--test-ssh") {
+                guard mode == .copilotTesting, let root, args.indices.contains(index + 1) else {
+                    throw NativeError("--test-ssh requires --copilot-testing and an isolated --state-dir.")
+                }
+                let executable = URL(fileURLWithPath: args[index + 1]).resolvingSymlinksInPath()
+                guard executable.path.hasPrefix(root.resolvingSymlinksInPath().path + "/"),
+                      FileManager.default.isExecutableFile(atPath: executable.path) else {
+                    throw NativeError("The test SSH executable must be inside the isolated state directory.")
+                }
+                testSSH = executable
+            } else { testSSH = nil }
+            let model = try AppModel(paths: paths, mode: mode, testSSHExecutable: testSSH)
             self.model = model
             configureMenu()
             status = StatusItemController(model: model)
@@ -44,7 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return try self.capture(kind: kind)
             }
             try model.start()
-            if args.contains("--show-hooks") {
+            if args.contains("--show-remotes") {
+                model.settingsSection = .remotes
+                openSettings()
+            } else if args.contains("--show-hooks") {
                 model.settingsSection = .hooks
                 openSettings()
             } else if firstLaunch || args.contains("--show-window") { openWelcome() }
