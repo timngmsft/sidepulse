@@ -75,6 +75,7 @@ final class BundleTests: XCTestCase {
         XCTAssertEqual(initial["mode"]?.string, "preview")
         XCTAssertEqual(initial["hookChangesAllowed"]?["copilot"]?.bool, false)
         let width = initial["ui"]?["width"]?.number
+        XCTAssertEqual(width, 89, "The status item should not include the extra 16-point outer buffer.")
         XCTAssertEqual(initial["ui"]?["segments"]?.number, 4)
         func assertState(_ expected: String, file: StaticString = #filePath, line: UInt = #line) throws -> JSONValue {
             let value = try request("snapshot")

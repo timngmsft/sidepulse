@@ -61,7 +61,7 @@ The hook commands emit no permission decisions and remain non-blocking for Copil
 
 ## Features
 
-- Fixed-width menu-bar item: four cyan LEDs chase for **Working**, red-orange LEDs breathe together for **Ask**, and green LEDs pulse once and settle for **Done**. **Idle** is dim and static.
+- Compact, fixed-width menu-bar item, sized to the widest label without extra outer padding: four cyan LEDs chase for **Working**, red-orange LEDs breathe together for **Ask**, and green LEDs pulse once and settle for **Done**. **Idle** is dim and static.
 - Core Animation rather than a per-frame application timer. Animations respect Reduce Motion and pause when displays sleep.
 - Native dashboard and settings, multi-agent priority, pending permission tracking, stale-activity expiry, session persistence, and recent history with JSON export.
 - Separate **Active** and **Recent** session sections, with short session/agent IDs and last-activity times. Completed items use a green checkmark instead of a status dot. Ended sessions are labeled **Ended**, so independent sessions in the same workspace do not look like duplicate agents.

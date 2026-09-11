@@ -131,7 +131,7 @@ final class StatusItemController {
 
     init(model: AppModel) {
         self.model = model
-        item = NSStatusBar.system.statusItem(withLength: 105)
+        item = NSStatusBar.system.statusItem(withLength: 89)
         strip = LEDStripView(frame: NSRect(x: 10, y: 7, width: 25, height: 8))
         actionTarget = StatusButtonTarget()
         if let button = item.button {
@@ -139,7 +139,7 @@ final class StatusItemController {
             button.imagePosition = .imageLeft
             button.title = " Working"
             button.font = .menuBarFont(ofSize: 0)
-            item.length = ceil(button.cell?.cellSize.width ?? 89) + 16
+            item.length = ceil(button.cell?.cellSize.width ?? 89)
             button.addSubview(strip)
             button.target = actionTarget
             button.action = #selector(StatusButtonTarget.clicked(_:))
