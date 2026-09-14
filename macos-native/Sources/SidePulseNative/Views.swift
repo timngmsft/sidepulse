@@ -206,6 +206,16 @@ struct SettingsView: View {
             Section("Application") {
                 Toggle("Start at login", isOn: Binding(get: { model.loginEnabled }, set: model.setLogin))
                     .disabled(model.development)
+                Toggle("Show status text", isOn: binding(\.menuBarTextEnabled))
+                Text("Turn off for a compact menu bar item containing only the five LEDs.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("Menu bar alignment", selection: binding(\.menuBarAlignment)) {
+                    ForEach(MenuBarAlignment.allCases) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.segmented).disabled(!model.configuration.menuBarTextEnabled)
+                Text(model.configuration.menuBarTextEnabled
+                     ? "Aligns the LEDs and label together inside the fixed-width menu bar item."
+                     : "Your alignment is preserved and will apply when status text is shown again.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Show agent status below the menu bar / notch", isOn: binding(\.screenBarEnabled))
                 Text("Animations respect macOS Reduce Motion and pause when displays sleep.")
                     .font(.caption).foregroundStyle(.secondary)

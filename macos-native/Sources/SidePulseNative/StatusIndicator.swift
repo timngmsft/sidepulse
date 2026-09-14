@@ -24,16 +24,29 @@ extension DisplayState {
     }
 }
 
+private enum MenuBarLEDLayout {
+    static let count = 5
+    static let segmentWidth: CGFloat = 4
+    static let gap: CGFloat = 3
+    static let height: CGFloat = 8
+    static let edgePadding: CGFloat = 2
+    static let width = CGFloat(count) * segmentWidth + CGFloat(count - 1) * gap
+    static let compactWidth = width + edgePadding * 2
+    static let imageSize = NSSize(width: compactWidth, height: 18)
+}
+
 @MainActor
 final class LEDStripView: NSView {
     private let count: Int
+    private let gap: CGFloat
     private var lights: [CALayer] = []
     private(set) var state = DisplayState.idle
     private var animationRevision = 0
     private var completion: DispatchWorkItem?
 
-    init(frame: NSRect, count: Int = 4) {
+    init(frame: NSRect, count: Int, gap: CGFloat) {
         self.count = count
+        self.gap = gap
         super.init(frame: frame)
         wantsLayer = true
         for _ in 0..<count {
@@ -46,12 +59,12 @@ final class LEDStripView: NSView {
             lights.append(light)
         }
         setAccessibilityElement(false)
+        needsLayout = true
     }
     required init?(coder: NSCoder) { nil }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func layout() {
         super.layout()
-        let gap: CGFloat = count == 4 ? 3 : 2
         let width = max(2, (bounds.width - gap * CGFloat(count - 1)) / CGFloat(count))
         CATransaction.begin(); CATransaction.setDisableActions(true)
         for (index, light) in lights.enumerated() {
@@ -110,6 +123,13 @@ final class LEDStripView: NSView {
         }
     }
     var animationCount: Int { lights.filter { !($0.animationKeys()?.isEmpty ?? true) }.count }
+    var segmentCount: Int { lights.count }
+    var segmentFrames: [JSONValue] {
+        lights.map {
+            .object(["x": .number($0.frame.minX), "y": .number($0.frame.minY),
+                     "width": .number($0.frame.width), "height": .number($0.frame.height)])
+        }
+    }
     var presentationOpacities: [JSONValue] {
         lights.map { .number(Double($0.presentation()?.opacity ?? -1)) }
     }
@@ -120,6 +140,13 @@ final class StatusItemController {
     private let model: AppModel
     private let item: NSStatusItem
     private let strip: LEDStripView
+    private let drawingCell: NSButtonCell
+    private let labeledWidth: CGFloat
+    private var alignment: MenuBarAlignment
+    private var textEnabled: Bool
+    private var contentFrame = NSRect.zero
+    private var titleFrame = NSRect.zero
+    private var imageFrame = NSRect.zero
     private let popover = NSPopover()
     private var subscriptions: Set<AnyCancellable> = []
     private var observers: [NSObjectProtocol] = []
@@ -129,22 +156,37 @@ final class StatusItemController {
     private var screenPanel: NSPanel?
     private var screenStrip: LEDStripView?
 
-    init(model: AppModel) {
+    init(model: AppModel) throws {
         self.model = model
-        item = NSStatusBar.system.statusItem(withLength: 89)
-        strip = LEDStripView(frame: NSRect(x: 10, y: 7, width: 25, height: 8))
-        actionTarget = StatusButtonTarget()
-        if let button = item.button {
-            button.image = NSImage(size: NSSize(width: 29, height: 18))
-            button.imagePosition = .imageLeft
-            button.title = " Working"
-            button.font = .menuBarFont(ofSize: 0)
-            item.length = ceil(button.cell?.cellSize.width ?? 89)
-            button.addSubview(strip)
-            button.target = actionTarget
-            button.action = #selector(StatusButtonTarget.clicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        alignment = model.configuration.menuBarAlignment
+        textEnabled = model.configuration.menuBarTextEnabled
+        let item = NSStatusBar.system.statusItem(withLength: MenuBarLEDLayout.compactWidth)
+        guard let button = item.button, let cell = button.cell as? NSButtonCell else {
+            NSStatusBar.system.removeStatusItem(item)
+            throw NativeError("Could not create the native menu bar button.")
         }
+        button.image = NSImage(size: MenuBarLEDLayout.imageSize)
+        button.imagePosition = .imageLeft
+        button.title = " Working"
+        button.font = .menuBarFont(ofSize: 0)
+        labeledWidth = ceil(cell.cellSize.width)
+        item.length = textEnabled ? labeledWidth : MenuBarLEDLayout.compactWidth
+        guard let drawingCell = cell.copy() as? NSButtonCell else {
+            NSStatusBar.system.removeStatusItem(item)
+            throw NativeError("Could not prepare the native menu bar text renderer.")
+        }
+        self.item = item
+        self.drawingCell = drawingCell
+        strip = LEDStripView(frame: NSRect(x: 0, y: 0, width: MenuBarLEDLayout.width, height: MenuBarLEDLayout.height),
+                             count: MenuBarLEDLayout.count, gap: MenuBarLEDLayout.gap)
+        actionTarget = StatusButtonTarget()
+        button.title = ""
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
+        button.addSubview(strip)
+        button.target = actionTarget
+        button.action = #selector(StatusButtonTarget.clicked(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         actionTarget.action = { [weak self] in self?.togglePopover() }
         popover.behavior = .transient
         popover.contentSize = NSSize(width: 420, height: 520)
@@ -156,6 +198,23 @@ final class StatusItemController {
         model.$configuration.map(\.screenBarEnabled).removeDuplicates().sink { [weak self] enabled in
             self?.updateScreenBar(enabled: enabled)
         }.store(in: &subscriptions)
+        model.$configuration.map(\.menuBarAlignment).removeDuplicates().sink { [weak self] alignment in
+            self?.alignment = alignment
+            self?.renderContent()
+        }.store(in: &subscriptions)
+        model.$configuration.map(\.menuBarTextEnabled).removeDuplicates().sink { [weak self] enabled in
+            self?.textEnabled = enabled
+            self?.renderContent()
+        }.store(in: &subscriptions)
+        button.postsFrameChangedNotifications = true
+        observers.append(NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification,
+                                                               object: button, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.renderContent() }
+        })
+        observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didChangeBackingPropertiesNotification,
+                                                               object: button.window, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.renderContent() }
+        })
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
                                             object: nil, queue: .main) { [weak self] _ in
@@ -173,6 +232,7 @@ final class StatusItemController {
                                                                object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                self.renderContent()
                 self.updateScreenBar(enabled: self.model.configuration.screenBarEnabled)
             }
         })
@@ -183,14 +243,78 @@ final class StatusItemController {
     private func setState(_ next: DisplayState) {
         let changed = state != next
         state = next
-        item.button?.title = " \(state.rawValue)"
         item.button?.toolTip = "SidePulse Native: \(state.rawValue)"
         item.button?.setAccessibilityLabel("SidePulse Native: \(state.rawValue)")
-        if let button = item.button, let rectangle = button.cell?.imageRect(forBounds: button.bounds) {
-            strip.frame = NSRect(x: rectangle.midX - 12.5, y: rectangle.midY - 4, width: 25, height: 8)
-        }
+        renderContent()
         strip.update(state: state, motion: motion, transition: changed)
         screenStrip?.update(state: state, motion: motion, transition: changed)
+    }
+    private func renderContent() {
+        guard let button = item.button else { return }
+        drawingCell.title = textEnabled ? " \(state.rawValue)" : ""
+        let desiredWidth = textEnabled ? labeledWidth : MenuBarLEDLayout.compactWidth
+        if item.length != desiredWidth { item.length = desiredWidth }
+        let size = button.bounds.size
+        if !textEnabled {
+            button.image = nil
+            imageFrame = .zero
+            titleFrame = .zero
+            contentFrame = NSRect(origin: .zero, size: size)
+            positionStrip(center: NSPoint(x: size.width / 2, y: size.height / 2))
+            return
+        }
+        let width = min(ceil(drawingCell.cellSize.width), size.width)
+        let x: CGFloat
+        switch alignment {
+        case .left: x = 0
+        case .center: x = (size.width - width) / 2
+        case .right: x = size.width - width
+        }
+        contentFrame = NSRect(x: x, y: 0, width: width, height: size.height)
+        let scale = button.window?.backingScaleFactor ?? 1
+        guard let context = CGContext(data: nil, width: Int(ceil(size.width * scale)),
+                                      height: Int(ceil(size.height * scale)), bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            model.report("Could not allocate the menu bar drawing context.")
+            return
+        }
+        context.scaleBy(x: scale, y: scale)
+        if button.isFlipped {
+            context.translateBy(x: 0, y: size.height)
+            context.scaleBy(x: 1, y: -1)
+        }
+        // Status buttons ignore text alignment. Keep their native font/layout, then let a template image
+        // supply the explicit content position and AppKit's normal appearance/highlight tint.
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: button.isFlipped)
+        button.effectiveAppearance.performAsCurrentDrawingAppearance {
+            drawingCell.drawInterior(withFrame: contentFrame, in: button)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let bitmap = context.makeImage() else {
+            model.report("Could not create the menu bar label image.")
+            return
+        }
+        let image = NSImage(cgImage: bitmap, size: size)
+        image.isTemplate = true
+        image.accessibilityDescription = state.rawValue
+        button.image = image
+        guard let canvas = button.cell?.imageRect(forBounds: button.bounds) else {
+            model.report("Could not position the menu bar content.")
+            return
+        }
+        imageFrame = canvas
+        let rectangle = drawingCell.imageRect(forBounds: contentFrame).offsetBy(dx: canvas.minX, dy: canvas.minY)
+        titleFrame = drawingCell.titleRect(forBounds: contentFrame).offsetBy(dx: canvas.minX, dy: canvas.minY)
+        positionStrip(center: NSPoint(x: rectangle.midX, y: rectangle.midY))
+    }
+    private func positionStrip(center: NSPoint) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        strip.frame = NSRect(x: center.x - MenuBarLEDLayout.width / 2, y: center.y - MenuBarLEDLayout.height / 2,
+                             width: MenuBarLEDLayout.width, height: MenuBarLEDLayout.height)
+        strip.layoutSubtreeIfNeeded()
+        CATransaction.commit()
     }
     private func refreshMotion() {
         strip.update(state: state, motion: motion, transition: false)
@@ -221,15 +345,27 @@ final class StatusItemController {
         panel.isOpaque = false; panel.backgroundColor = .clear
         panel.level = .statusBar; panel.ignoresMouseEvents = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let view = LEDStripView(frame: NSRect(origin: .zero, size: frame.size), count: 8)
+        let view = LEDStripView(frame: NSRect(origin: .zero, size: frame.size), count: 8, gap: 2)
         panel.contentView = view
         view.update(state: state, motion: motion, transition: false)
         screenPanel = panel; screenStrip = view
         if !screensSleeping { panel.orderFrontRegardless() }
     }
     var diagnostics: [String: JSONValue] {
-        ["label": .string(item.button?.title.trimmingCharacters(in: .whitespaces) ?? ""),
-         "width": .number(item.length), "segments": .number(4),
+        ["label": .string(drawingCell.title.trimmingCharacters(in: .whitespaces)),
+         "width": .number(item.length), "segments": .number(Double(strip.segmentCount)),
+         "textEnabled": .bool(textEnabled),
+         "buttonWidth": .number(Double(item.button?.bounds.width ?? 0)),
+         "segmentFrames": .array(strip.segmentFrames),
+         "tooltip": .string(item.button?.toolTip ?? ""),
+         "accessibilityLabel": .string(item.button?.accessibilityLabel() ?? ""),
+         "alignment": .string(alignment.rawValue),
+         "contentX": .number(contentFrame.minX), "contentWidth": .number(contentFrame.width),
+         "stripX": .number(strip.frame.minX), "titleX": .number(titleFrame.minX),
+         "titleWidth": .number(titleFrame.width), "fontSize": .number(Double(drawingCell.font?.pointSize ?? 0)),
+         "fontName": .string(drawingCell.font?.fontName ?? ""),
+         "imageX": .number(imageFrame.minX), "imageWidth": .number(imageFrame.width),
+         "template": .bool(item.button?.image?.isTemplate == true),
          "animations": .number(Double(strip.animationCount)),
          "presentationOpacities": .array(strip.presentationOpacities),
          "visible": .bool(strip.window?.isVisible == true && !strip.isHiddenOrHasHiddenAncestor),

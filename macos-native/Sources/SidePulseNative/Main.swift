@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let model = try AppModel(paths: paths, mode: mode, testSSHExecutable: testSSH)
             self.model = model
             configureMenu()
-            status = StatusItemController(model: model)
+            status = try StatusItemController(model: model)
             model.showSettings = { [weak self] in self?.openSettings() }
             model.showDashboard = { [weak self] in self?.openHistory() }
             model.captureWindow = { [weak self] kind in

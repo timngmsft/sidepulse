@@ -81,7 +81,9 @@ open "macos-native/dist/SidePulse Native.app" --args --copilot-testing --show-re
 
 ## Features
 
-- Compact, fixed-width menu-bar item, sized to the widest label without extra outer padding: four cyan LEDs chase for **Working**, red-orange LEDs breathe together for **Ask**, and green LEDs pulse once and settle for **Done**. **Idle** is dim and static.
+- Five menu-bar LEDs: cyan LEDs chase for **Working**, red-orange LEDs breathe together for **Ask**, and green LEDs pulse once and settle for **Done**. **Idle** is dim and static.
+- **General > Show status text** controls the label. Turn it off for a **36 pt LED-only item**: five 4 pt LEDs, four 3 pt gaps, and 2 pt padding at each edge, with no reserved text space. State remains available in the tooltip, accessibility label, and dashboard. Text is enabled by default for existing installations; both modes preserve their width across state changes.
+- **General > Menu bar alignment** offers **Left / Center / Right** justification of the LEDs and label as one group. Changes apply immediately and persist across launches. **Center** is the default. Alignment is disabled but preserved in LED-only mode and restored when text is shown again. The labeled item uses the native menu-bar font and is sized to the widest label plus the five LEDs.
 - Core Animation rather than a per-frame application timer. Animations respect Reduce Motion and pause when displays sleep.
 - Native dashboard and settings, multi-agent priority, pending permission tracking, stale-activity expiry, session persistence, and recent history with JSON export.
 - Separate **Active** and **Recent** session sections, with short session/agent IDs and last-activity times. Completed items use a green checkmark instead of a status dot. Ended sessions are labeled **Ended**, so independent sessions in the same workspace do not look like duplicate agents.
@@ -132,6 +134,8 @@ printf '%s\n' '{"hook_event_name":"UserPromptSubmit","session_id":"demo"}' |
 ```
 
 The helper also accepts `--ping`. Preview and Copilot-testing `--request` actions include `clear`, `capture`, `capture-status`, `capture-settings`, `capture-hooks`, `capture-devices`, `capture-remotes`, `capture-history`, `show-settings`, and `quit`. Captures render only this application's own views and windows, not the desktop. These diagnostics are not needed for normal use.
+
+The preview-only IPC action `set-menu-alignment` accepts an `alignment` field of `Left`, `Center`, or `Right` for bundled UI checks. `set-menu-text` accepts a boolean `enabled` field to exercise live compact-mode changes. Both General settings are available in every application mode.
 
 ```text
 Sources/SidePulseCore/     Event/state logic, IPC, hooks, persistence, LED programs

@@ -11,6 +11,11 @@ public enum AwakePolicy: String, Codable, CaseIterable, Identifiable {
     public var id: String { rawValue }
 }
 
+public enum MenuBarAlignment: String, Codable, CaseIterable, Identifiable, Sendable {
+    case left = "Left", center = "Center", right = "Right"
+    public var id: String { rawValue }
+}
+
 public struct DevicePreference: Codable, Equatable {
     public var enabled = true
     public var display = DeviceDisplay.agent
@@ -64,6 +69,8 @@ public struct AppConfiguration: Codable, Equatable {
     public var version = 1
     public var physicalLEDsEnabled = false
     public var screenBarEnabled = false
+    public var menuBarAlignment = MenuBarAlignment.center
+    public var menuBarTextEnabled = true
     public var ejectPreventionEnabled = false
     public var awakePolicy = AwakePolicy.never
     public var minimumBatteryPercent = 20.0
@@ -72,6 +79,28 @@ public struct AppConfiguration: Codable, Equatable {
     public var devices: [String: DevicePreference] = [:]
     public var remotes: [RemoteConfiguration] = []
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case version, physicalLEDsEnabled, screenBarEnabled, menuBarAlignment, menuBarTextEnabled, ejectPreventionEnabled
+        case awakePolicy, minimumBatteryPercent, staleAfterSeconds, doneVisibleSeconds, devices, remotes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(Int.self, forKey: .version)
+        physicalLEDsEnabled = try values.decode(Bool.self, forKey: .physicalLEDsEnabled)
+        screenBarEnabled = try values.decode(Bool.self, forKey: .screenBarEnabled)
+        menuBarAlignment = try values.decodeIfPresent(MenuBarAlignment.self, forKey: .menuBarAlignment) ?? .center
+        menuBarTextEnabled = try values.decodeIfPresent(Bool.self, forKey: .menuBarTextEnabled) ?? true
+        ejectPreventionEnabled = try values.decode(Bool.self, forKey: .ejectPreventionEnabled)
+        awakePolicy = try values.decode(AwakePolicy.self, forKey: .awakePolicy)
+        minimumBatteryPercent = try values.decode(Double.self, forKey: .minimumBatteryPercent)
+        staleAfterSeconds = try values.decode(Double.self, forKey: .staleAfterSeconds)
+        doneVisibleSeconds = try values.decode(Double.self, forKey: .doneVisibleSeconds)
+        devices = try values.decode([String: DevicePreference].self, forKey: .devices)
+        remotes = try values.decode([RemoteConfiguration].self, forKey: .remotes)
+    }
+
     public func validate() throws {
         guard version == 1 else { throw NativeError("Unsupported native settings version.") }
         guard staleAfterSeconds.isFinite, staleAfterSeconds >= 30,

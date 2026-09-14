@@ -350,6 +350,16 @@ final class AppModel: ObservableObject {
                     return try JSONEncoder().encode(JSONValue.object(object))
                 case "clear" where development:
                     clearSessions()
+                case "set-menu-alignment" where mode.permitsSimulation:
+                    guard let raw = value["alignment"]?.string, let alignment = MenuBarAlignment(rawValue: raw) else {
+                        throw NativeError("Menu bar alignment must be Left, Center, or Right.")
+                    }
+                    guard update({ $0.menuBarAlignment = alignment }) else { throw NativeError("Could not save menu bar alignment.") }
+                case "set-menu-text" where mode.permitsSimulation:
+                    guard let enabled = value["enabled"]?.bool else {
+                        throw NativeError("Status text visibility requires a boolean enabled field.")
+                    }
+                    guard update({ $0.menuBarTextEnabled = enabled }) else { throw NativeError("Could not save status text visibility.") }
                 case "set-test-remotes" where testSSHExecutable != nil:
                     guard let remotes = value["remotes"] else { throw NativeError("Missing test remotes.") }
                     let decoded = try JSONDecoder().decode([RemoteConfiguration].self, from: JSONEncoder().encode(remotes))

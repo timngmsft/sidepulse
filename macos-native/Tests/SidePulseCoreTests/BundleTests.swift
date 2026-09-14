@@ -75,8 +75,8 @@ final class BundleTests: XCTestCase {
         XCTAssertEqual(initial["mode"]?.string, "preview")
         XCTAssertEqual(initial["hookChangesAllowed"]?["copilot"]?.bool, false)
         let width = initial["ui"]?["width"]?.number
-        XCTAssertEqual(width, 89, "The status item should not include the extra 16-point outer buffer.")
-        XCTAssertEqual(initial["ui"]?["segments"]?.number, 4)
+        XCTAssertEqual(width, 96, "The labeled item should fit five LEDs and the widest label without extra outer padding.")
+        XCTAssertEqual(initial["ui"]?["segments"]?.number, 5)
         func assertState(_ expected: String, file: StaticString = #filePath, line: UInt = #line) throws -> JSONValue {
             let value = try request("snapshot")
             XCTAssertEqual(value["state"]?.string, expected, file: file, line: line)
@@ -87,7 +87,7 @@ final class BundleTests: XCTestCase {
 
         try send("UserPromptSubmit")
         let working = try assertState("Working")
-        XCTAssertEqual(working["ui"]?["animations"]?.number, working["ui"]?["reduceMotion"]?.bool == true ? 0 : 4)
+        XCTAssertEqual(working["ui"]?["animations"]?.number, working["ui"]?["reduceMotion"]?.bool == true ? 0 : 5)
         if working["ui"]?["reduceMotion"]?.bool == false && working["ui"]?["visible"]?.bool == true {
             Thread.sleep(forTimeInterval: 0.35)
             let animated = try request("snapshot")
@@ -95,7 +95,7 @@ final class BundleTests: XCTestCase {
         }
         try send("PermissionRequest", extra: ["tool_name": .string("Bash"), "tool_use_id": .string("approval")])
         let ask = try assertState("Ask")
-        XCTAssertEqual(ask["ui"]?["animations"]?.number, ask["ui"]?["reduceMotion"]?.bool == true ? 0 : 4)
+        XCTAssertEqual(ask["ui"]?["animations"]?.number, ask["ui"]?["reduceMotion"]?.bool == true ? 0 : 5)
         try send("UserPromptSubmit", id: "beta")
         _ = try assertState("Ask")
         try send("PostToolUse", extra: ["tool_name": .string("Bash"), "tool_use_id": .string("approval")])

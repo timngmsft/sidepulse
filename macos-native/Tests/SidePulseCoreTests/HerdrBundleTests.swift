@@ -78,6 +78,16 @@ final class HerdrBundleTests: XCTestCase {
             snapshot["sessions"]?.array?.filter { $0["remoteID"]?.string != nil } ?? []
         }
         func streamCount() throws -> Int { try fixture.read("calls").components(separatedBy: "while :;").count - 1 }
+        func waitForStreams(_ expected: Int) throws -> Int {
+            // A successful preflight publishes Connected before the polling process starts.
+            let deadline = Date().addingTimeInterval(3)
+            var count = try streamCount()
+            while count < expected && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.02)
+                count = try streamCount()
+            }
+            return count
+        }
 
         let connected = try waitFor {
             $0["remotes"]?[first.id]?["state"]?.string == "connected" &&
@@ -86,7 +96,7 @@ final class HerdrBundleTests: XCTestCase {
         }
         XCTAssertEqual(connected["remotesAllowed"]?.bool, true)
         XCTAssertEqual(connected["systemChangesAllowed"]?.bool, false)
-        XCTAssertEqual(connected["ui"]?["width"]?.number, 89)
+        XCTAssertEqual(connected["ui"]?["width"]?.number, 96)
         for provider in Provider.allCases {
             XCTAssertEqual(connected["hookChangesAllowed"]?[provider.rawValue]?.bool, provider == .copilot)
         }
@@ -100,7 +110,7 @@ final class HerdrBundleTests: XCTestCase {
         if let destination = ProcessInfo.processInfo.environment["SIDEPULSE_REMOTE_CAPTURE"] {
             try FileManager.default.copyItem(atPath: image, toPath: destination)
         }
-        let streams = try streamCount()
+        let streams = try waitForStreams(2)
         XCTAssertEqual(streams, 2)
 
         first.name = "Renamed remote"
@@ -121,7 +131,7 @@ final class HerdrBundleTests: XCTestCase {
         try saveRemotes()
         let replaced = try waitFor { remoteSessions($0).count == 2 && $0["remotes"]?[first.id]?["state"]?.string == "connected" }
         XCTAssertEqual(remoteSessions(replaced).first { $0["remoteID"]?.string == second.id }?["updatedAt"], secondAge)
-        XCTAssertEqual(try streamCount(), streams + 1, "Endpoint edits must not restart unrelated remotes.")
+        XCTAssertEqual(try waitForStreams(streams + 1), streams + 1, "Endpoint edits must not restart unrelated remotes.")
 
         let question = HookEnvelope(provider: .copilot, line: .object([
             "hook_event_name": .string("Notification"), "notification_type": .string("elicitation_dialog"),
@@ -136,7 +146,7 @@ final class HerdrBundleTests: XCTestCase {
             remoteSessions($0).count == 2 && remoteSessions($0).allSatisfy { $0["mode"]?.string == "completed" }
         }
         XCTAssertEqual(completed["state"]?.string, "Ask", "Remote completions must not hide a local question.")
-        XCTAssertEqual(completed["ui"]?["width"]?.number, 89)
+        XCTAssertEqual(completed["ui"]?["width"]?.number, 96)
 
         _ = try request("test-sleep")
         let asleep = try waitFor { remoteSessions($0).isEmpty && $0["remotes"]?[first.id]?["state"]?.string == "paused" }
