@@ -73,6 +73,8 @@ For a host on your local network, macOS may request Local Network access. If SSH
 
 Each enabled remote uses a persistent SSH polling connection with a two-second interval. Working and blocked agents become **Working** and **Ask** in the same aggregation as local sessions. Only an observed active-to-settled transition becomes **Done**; startup, reconnect, and wake do not invent completions. Completion duration follows the Activity setting. Remote state expires after 15 seconds without an authoritative snapshot, and remote sessions are never persisted as local sessions. Monitoring pauses during system sleep and resumes with a new baseline on wake.
 
+Heartbeat freshness is kept separately from UI changes. Unchanged polls do not redraw the dashboard or unrelated Settings tabs, or reorder otherwise unchanged session rows. The Remotes tab still receives live connection details and last-update times; actual activity, metadata changes, and expiry continue to update the UI.
+
 To open the tab when launching an already-built app that is not running:
 
 ```sh
@@ -119,6 +121,8 @@ This is a separate native implementation, not a complete migration of every lega
 ```
 
 Core XCTest coverage includes event normalization, question detection, aggregation, permissions, expiry, hook preservation, native IPC, offline events, and LED write scheduling. Copilot coverage includes restricted-mode policy, dialog notifications, bounded transcript reads, compatible hook payloads, and a missing-helper fail-open case. Herdr fixtures exercise strict protocol parsing, legacy and structured session references, remote-only agent types, discovery, stable completion timestamps, reconnect baselines, grace expiry, executable replacement, bounded stdout/stderr, cancellation under continuous output, and authentication acknowledgement/failure/cancellation.
+
+Presentation coverage verifies that heartbeat-only timestamps and ordering do not invalidate the UI while content changes and timed expiry still do. The bundled Herdr case checks that raw heartbeat timestamps keep advancing without application-wide UI notifications; the read-only `ui.modelUpdates` snapshot counter supports that check.
 
 The smoke script opens a relocated app bundle with isolated data and drives its bundled helper through the actual UI's Working / Ask / Done transitions, completion settling and expiry, window rendering, persistence, and offline replay. It also installs Copilot hooks in a fixture home, executes the actual generated commands, and removes them without modifying real agent configuration. A separate bundled-app case uses two fake SSH remotes to exercise the live Remotes tab, selective reconfiguration, local Ask priority, sleep/wake, and shutdown. Its `--test-ssh` injection requires `--copilot-testing`, an explicit `--state-dir`, and a fixture executable inside that directory; it is not used by ordinary launches.
 

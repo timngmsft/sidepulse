@@ -67,18 +67,7 @@ struct DashboardView: View {
                         }
                     }
                     if model.mode.permitsRemotes && !model.configuration.remotes.isEmpty {
-                        Text("REMOTES").font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 8)
-                        ForEach(model.configuration.remotes) { remote in
-                            HStack {
-                                Image(systemName: "network")
-                                VStack(alignment: .leading) {
-                                    Text(remote.displayName).font(.caption.weight(.medium))
-                                    Text(model.remoteStatus[remote.id]?.summary ?? "Disabled")
-                                        .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                                }
-                                Spacer()
-                            }
-                        }
+                        DashboardRemotesView(remotes: model.configuration.remotes, connections: model.remoteStatus)
                     }
                 }.padding(14)
             }.frame(minHeight: 180, maxHeight: 400)
@@ -102,13 +91,41 @@ struct DashboardView: View {
     }
 }
 
+private struct DashboardRemotesView: View {
+    let remotes: [RemoteConfiguration]
+    let connections: RemoteStatusModel
+    @State private var summaries: [String: String]
+
+    init(remotes: [RemoteConfiguration], connections: RemoteStatusModel) {
+        self.remotes = remotes
+        self.connections = connections
+        _summaries = State(initialValue: connections.values.mapValues(\.summary))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("REMOTES").font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 8)
+            ForEach(remotes) { remote in
+                HStack {
+                    Image(systemName: "network")
+                    VStack(alignment: .leading) {
+                        Text(remote.displayName).font(.caption.weight(.medium))
+                        Text(summaries[remote.id] ?? "Disabled")
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                    }
+                    Spacer()
+                }
+            }
+        }.onReceive(connections.$values.map { $0.mapValues(\.summary) }.removeDuplicates()) {
+            summaries = $0
+        }
+    }
+}
+
 private struct SessionRow: View {
     @ObservedObject var model: AppModel
     let session: AgentSession
-    var mode: AgentMode {
-        session.effectiveMode(at: Date(), staleAfter: model.configuration.staleAfterSeconds,
-                              doneVisible: model.configuration.doneVisibleSeconds)
-    }
+    var mode: AgentMode { session.mode }
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Group {
@@ -264,7 +281,7 @@ struct SettingsView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                             if provider == .copilot && model.installedHooks[provider] == true {
                                 if let latest = model.snapshot.sessions.filter({ $0.provider == .copilot })
-                                    .max(by: { $0.observedAt < $1.observedAt }) {
+                                    .max(by: { $0.updatedAt < $1.updatedAt }) {
                                     Text("Last event: \(latest.event)").font(.caption).foregroundStyle(.secondary)
                                 } else {
                                     Text("Waiting for activity. Start a new Copilot CLI session.")
@@ -357,7 +374,14 @@ private struct DeviceSettingsView: View {
 
 struct RemotesView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject private var connections: RemoteStatusModel
     @State private var editing: RemoteConfiguration?
+
+    init(model: AppModel) {
+        self.model = model
+        connections = model.remoteStatus
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Herdr remotes").font(.title2.weight(.semibold))
@@ -376,9 +400,9 @@ struct RemotesView: View {
                                 }
                                 Text(remote.target + (remote.normalizedSession.isEmpty ? "" : " / \(remote.normalizedSession)"))
                                     .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                                RemoteConnectionDetail(connection: model.remoteStatus[remote.id] ?? HerdrConnectionStatus(.disabled))
+                                RemoteConnectionDetail(connection: connections[remote.id] ?? HerdrConnectionStatus(.disabled))
                                 HStack {
-                                    if model.remoteStatus[remote.id]?.state == .authenticating {
+                                    if connections[remote.id]?.state == .authenticating {
                                         Button("Cancel Authentication") { model.cancelAuthentication(remote.id) }
                                     } else {
                                         Button("Authenticate in Terminal") { model.authenticate(remote) }.disabled(!remote.enabled)

@@ -113,6 +113,19 @@ final class HerdrBundleTests: XCTestCase {
         let streams = try waitForStreams(2)
         XCTAssertEqual(streams, 2)
 
+        _ = try request("capture-settings")
+        let beforeHeartbeat = try request("snapshot")
+        let modelUpdates = try XCTUnwrap(beforeHeartbeat["ui"]?["modelUpdates"]?.number)
+        Thread.sleep(forTimeInterval: 1.1)
+        let afterHeartbeat = try request("snapshot")
+        XCTAssertNotEqual(afterHeartbeat["remotes"]?[first.id]?["lastSuccess"],
+                          beforeHeartbeat["remotes"]?[first.id]?["lastSuccess"])
+        XCTAssertNotEqual(remoteSessions(afterHeartbeat).first { $0["remoteID"]?.string == first.id }?["observedAt"],
+                          remoteSessions(beforeHeartbeat).first { $0["remoteID"]?.string == first.id }?["observedAt"])
+        XCTAssertEqual(afterHeartbeat["ui"]?["modelUpdates"]?.number, modelUpdates,
+                       "Unchanged remote heartbeats must not invalidate the application-wide UI model.")
+        XCTAssertEqual(afterHeartbeat["ui"]?["label"]?.string, "Working")
+
         first.name = "Renamed remote"
         try saveRemotes()
         Thread.sleep(forTimeInterval: 0.2)

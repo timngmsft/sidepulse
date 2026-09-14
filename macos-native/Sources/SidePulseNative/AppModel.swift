@@ -11,7 +11,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var battery: BatteryState?
     @Published private(set) var history: [HistoryEntry] = []
     @Published var notice: String?
-    @Published private(set) var remoteStatus: [String: HerdrConnectionStatus] = [:]
+    let remoteStatus = RemoteStatusModel()
     @Published var installedHooks: [Provider: Bool] = [:]
     @Published private(set) var hookFiles: [Provider: URL] = [:]
     @Published private(set) var keepingAwake = false
@@ -345,7 +345,7 @@ final class AppModel: ObservableObject {
                     }))
                     object["systemChangesAllowed"] = .bool(!mode.restrictsSystemChanges)
                     object["remotesAllowed"] = .bool(mode.permitsRemotes)
-                    object["remotes"] = try JSONDecoder().decode(JSONValue.self, from: JSONCoding.encoder().encode(remoteStatus))
+                    object["remotes"] = try JSONDecoder().decode(JSONValue.self, from: JSONCoding.encoder().encode(remoteStatus.values))
                     object["ok"] = .bool(true)
                     return try JSONEncoder().encode(JSONValue.object(object))
                 case "clear" where development:
@@ -422,8 +422,7 @@ final class AppModel: ObservableObject {
     private func refresh() {
         guard !quitting, !sleeping else { return }
         let next = store.snapshot()
-        let changed = next.state != snapshot.state || next.sessions != snapshot.sessions || next.activeCount != snapshot.activeCount
-        if changed { snapshot = next; applyServices() }
+        if !next.hasSamePresentation(as: snapshot) { snapshot = next; applyServices() }
         if history.last?.state != next.state || Date().timeIntervalSince(lastHistory) >= 60 {
             lastHistory = Date()
             history.append(HistoryEntry(date: lastHistory, state: next.state, activeCount: next.activeCount, batteryPercent: battery?.percent))
@@ -444,8 +443,8 @@ final class AppModel: ObservableObject {
     }
 
     private func applyServices(forceDeviceRefresh: Bool = false) {
-        let working = snapshot.sessions.contains {
-            $0.effectiveMode(at: Date(), staleAfter: configuration.staleAfterSeconds, doneVisible: configuration.doneVisibleSeconds).isWorking
+        let working = store.snapshot().sessions.contains {
+            $0.mode.isWorking
             && (configuration.awakePolicy != .local || $0.remoteID == nil)
         }
         let requested = configuration.awakePolicy == .always ||
@@ -453,7 +452,7 @@ final class AppModel: ObservableObject {
         let lowBattery = battery.map { !$0.plugged && $0.percent < configuration.minimumBatteryPercent } ?? false
         do {
             try awake.update(shouldHold: requested && !lowBattery && !sleeping && !development)
-            keepingAwake = awake.isHolding
+            if keepingAwake != awake.isHolding { keepingAwake = awake.isHolding }
             let protected = devices.filter { $0.name.lowercased().filter(\.isLetter).contains("sidepulsepro") }
             try ejectGuard.setEnabled(configuration.ejectPreventionEnabled && !development, volumes: protected.map(\.root))
         } catch { report(error.localizedDescription) }
@@ -497,7 +496,7 @@ final class AppModel: ObservableObject {
                 cancelAuthentication(id, reconnect: false)
             }
         }
-        remoteStatus = remoteStatus.filter { id, _ in configuration.remotes.contains { $0.id == id } }
+        remoteStatus.retain(Set(configuration.remotes.map(\.id)))
         for remote in configuration.remotes {
             if !remote.enabled || !mode.permitsRemotes { remoteStatus[remote.id] = HerdrConnectionStatus(.disabled) }
             else if sleeping { remoteStatus[remote.id] = HerdrConnectionStatus(.paused) }

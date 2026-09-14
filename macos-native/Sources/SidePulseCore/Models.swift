@@ -198,6 +198,20 @@ public struct MonitorSnapshot: Codable, Sendable {
             SessionListSection(title: "Recent", sessions: visible.filter { !$0.mode.isActive })
         ].filter { !$0.sessions.isEmpty }
     }
+
+    public func hasSamePresentation(as other: MonitorSnapshot) -> Bool {
+        guard state == other.state, activeCount == other.activeCount,
+              sessions.count == other.sessions.count else { return false }
+        // Heartbeat timestamps and heartbeat-only reordering must not invalidate the UI.
+        // SessionStore still owns fresh observations and computes effective modes.
+        let left = sessions.sorted { $0.id < $1.id }
+        let right = other.sessions.sorted { $0.id < $1.id }
+        return zip(left, right).allSatisfy { lhs, rhs in
+            var comparable = lhs
+            comparable.observedAt = rhs.observedAt
+            return comparable == rhs
+        }
+    }
 }
 
 public struct HookEnvelope: Codable, Sendable {

@@ -149,6 +149,7 @@ final class StatusItemController {
     private var imageFrame = NSRect.zero
     private let popover = NSPopover()
     private var subscriptions: Set<AnyCancellable> = []
+    private var modelUpdates = 0
     private var observers: [NSObjectProtocol] = []
     private var state = DisplayState.idle
     private var screensSleeping = false
@@ -192,6 +193,9 @@ final class StatusItemController {
         popover.contentSize = NSSize(width: 420, height: 520)
         popover.contentViewController = NSHostingController(rootView: DashboardView(model: model))
         popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        model.objectWillChange.sink { [weak self] _ in
+            self?.modelUpdates += 1
+        }.store(in: &subscriptions)
         model.$snapshot.map(\.state).removeDuplicates().sink { [weak self] state in
             self?.setState(state)
         }.store(in: &subscriptions)
@@ -355,6 +359,7 @@ final class StatusItemController {
         ["label": .string(drawingCell.title.trimmingCharacters(in: .whitespaces)),
          "width": .number(item.length), "segments": .number(Double(strip.segmentCount)),
          "textEnabled": .bool(textEnabled),
+         "modelUpdates": .number(Double(modelUpdates)),
          "buttonWidth": .number(Double(item.button?.bounds.width ?? 0)),
          "segmentFrames": .array(strip.segmentFrames),
          "tooltip": .string(item.button?.toolTip ?? ""),
