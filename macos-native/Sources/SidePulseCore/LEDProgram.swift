@@ -81,5 +81,20 @@ public enum LEDProgram {
         try handle.truncate(atOffset: 0)
         try handle.write(contentsOf: Data(program.utf8))
         try handle.synchronize()
+        try handle.close()
+    }
+
+    public static func keepAlive(at root: URL) throws {
+        let file = root.appendingPathComponent("keepalive")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            guard FileManager.default.createFile(atPath: file.path, contents: nil) else {
+                throw NativeError("Could not create the SidePulse keepalive file.")
+            }
+        }
+        try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        try handle.synchronize()
+        try handle.close()
     }
 }

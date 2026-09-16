@@ -10,8 +10,10 @@ Requires macOS 13 or later and a Swift 6 toolchain. Full Xcode is required for t
 
 ```sh
 ./macos-native/build.sh
-open "macos-native/dist/SidePulse Native.app"
+./start-native.sh
 ```
+
+The launcher starts the full native application by default and forwards optional application flags. Quit an already-running preview or restricted testing instance before switching modes.
 
 The script builds for the current Mac's architecture and signs the bundle locally. It uses `/Applications/Xcode.app` when available, without changing the system's selected developer directory. Set `DEVELOPER_DIR` to override that selection. No packages are downloaded.
 
@@ -46,7 +48,7 @@ The bundle identifier is `io.sidepulse.native`. Its private event socket is `/tm
 The **Install** buttons are intentionally disabled in the simulated preview. Quit that instance, then start the restricted live-testing mode from the repository root:
 
 ```sh
-./start-native.sh
+./start-native.sh --copilot-testing --show-hooks
 ```
 
 **GitHub Copilot > Install / Update / Remove** and **Remotes** are enabled in this mode. The other local providers, physical output, keep-awake, eject prevention, and login registration remain disabled. No hooks are installed automatically. The `--copilot-testing` launch flag is retained for compatibility.
@@ -58,6 +60,22 @@ Without a `--state-dir` override, this mode uses the normal native data director
 Copilot hooks use PascalCase event names to select VS Code-compatible input and pass their registered event name as a legacy-format fallback. Permission and question-dialog notifications produce **Ask**; background completion notifications do not end an active or waiting parent session. For a Stop event that lacks reply text, the native helper reads at most the final 256 KiB of the supplied transcript to find the latest assistant reply. This is an on-demand read, not transcript polling or an ML classifier.
 
 The hook commands emit no permission decisions and remain non-blocking for Copilot even if the app bundle is moved, removed, or unavailable. Failures are reported to stderr; the running helper queues events when the receiver is offline.
+
+## Hardware output
+
+Quit the Python app or any other app controlling the same device, then launch the native app normally:
+
+```sh
+./start-native.sh --show-devices
+```
+
+In **Settings > Devices**, enable **physical LED output**. Mounted SidePulse Pro (eight LEDs) and SidePulse Dot / PulseDot (two LEDs) devices are detected automatically. Leave a device on **Agent** to mirror the aggregate state: cyan chasing pulses for Working, red-orange pulses for Ask, steady green for Done, and a dim Idle pulse. Per-device brightness, Battery mode, and Custom programs are also available. macOS may request access to removable volumes; allow access for the connected SidePulse.
+
+LED writes, retries, and the once-per-minute device keepalive run on a background queue, not the UI thread. Writes update `LEDS.LED` in place. Unchanged states do not restart animations. Disconnecting cancels pending writes; reconnecting restores the configured display. Disabling a device or global output writes `off` once before releasing it. Sleep turns managed output off and pauses keepalives; wake restores it. Quitting drains final off commands asynchronously with a bounded shutdown deadline.
+
+Hardware remains disabled in `--development` and `--copilot-testing` modes. Enabling physical output does not enable keep-awake, login registration, or eject prevention.
+
+The read-only `snapshot` response includes `hardware` diagnostics: enabled/allowed flags, detected devices, desired programs, and write-attempt/completion counts. A macOS removable-volume consent dialog can pause the first file open without blocking the UI; grant access in that system dialog to let output proceed.
 
 ## Herdr remotes
 
@@ -100,6 +118,14 @@ open "macos-native/dist/SidePulse Native.app" --args --copilot-testing --show-re
 
 To receive real activity, open the app normally and explicitly install the desired provider's hooks from **Settings > Agent Hooks**. Restart that agent afterward. Codex may require approving the new hooks. Native installation preserves existing SidePulse hooks, so both apps can observe activity while comparing them. Keep only one app in control of a physical device.
 
+## Local completion fallback
+
+If a final `Stop` hook is missed, an implicit local `PostToolUse` Working state settles to **Done** after two minutes without a newer status event. This applies to Codex, Claude, GitHub Copilot, and Grok. A new tool start, prompt, question, or other status event supersedes the fallback; another successful tool completion starts a new settling interval. Explicit status fields or message markers, pending approvals, recognized errors, and remote Herdr activity are not auto-completed.
+
+**General > Show completion for** counts from the fixed two-minute settling boundary, so even the one-minute option has a visible Done window. The existing stale-activity cutoff can end that window sooner. Unlike Python's event-age-based completion expiry, the native duration does not include the initial two-minute wait. Source event timestamps and modes are not rewritten, and polling, offline replay, or restarting the app does not restart either interval. The menu bar, session list, active count, history, and activity-based keep-awake decisions use the same effective state.
+
+This is a missing-hook heuristic, not proof that an agent finished. An agent silently thinking for more than two minutes after a tool completion can therefore appear Done; an explicit Working status suppresses this inference until the next status event. Existing saved sessions lack the information needed to distinguish explicit Working from implicit Working, so they retain their previous expiry behavior until a new hook arrives. Newly received events persist their optional settling deadline for safe restarts.
+
 ## Scope and limitations
 
 This is a separate native implementation, not a complete migration of every legacy feature:
@@ -122,7 +148,11 @@ This is a separate native implementation, not a complete migration of every lega
 
 Core XCTest coverage includes event normalization, question detection, aggregation, permissions, expiry, hook preservation, native IPC, offline events, and LED write scheduling. Copilot coverage includes restricted-mode policy, dialog notifications, bounded transcript reads, compatible hook payloads, and a missing-helper fail-open case. Herdr fixtures exercise strict protocol parsing, legacy and structured session references, remote-only agent types, discovery, stable completion timestamps, reconnect baselines, grace expiry, executable replacement, bounded stdout/stderr, cancellation under continuous output, and authentication acknowledgement/failure/cancellation.
 
+Post-tool settling coverage checks the exact two-minute boundary, all completion-duration choices, explicit fields and message markers, pending permissions, new and delayed events, aggregation, stale expiry, and persistence compatibility. The bundled app also exercises Working / Done / Idle without a final Stop, including timed UI updates, completion-animation settling, history, and restart behavior.
+
 Presentation coverage verifies that heartbeat-only timestamps and ordering do not invalidate the UI while content changes and timed expiry still do. The bundled Herdr case checks that raw heartbeat timestamps keep advancing without application-wide UI notifications; the read-only `ui.modelUpdates` snapshot counter supports that check.
+
+Hardware coverage checks in-place writes, device release, unplug/reconnect cancellation, retry recovery, keepalive ownership, and bounded shutdown without touching real devices.
 
 The smoke script opens a relocated app bundle with isolated data and drives its bundled helper through the actual UI's Working / Ask / Done transitions, completion settling and expiry, window rendering, persistence, and offline replay. It also installs Copilot hooks in a fixture home, executes the actual generated commands, and removes them without modifying real agent configuration. A separate bundled-app case uses two fake SSH remotes to exercise the live Remotes tab, selective reconfiguration, local Ask priority, sleep/wake, and shutdown. Its `--test-ssh` injection requires `--copilot-testing`, an explicit `--state-dir`, and a fixture executable inside that directory; it is not used by ordinary launches.
 

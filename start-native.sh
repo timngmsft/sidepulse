@@ -9,4 +9,4 @@ if [ ! -x "$APP/Contents/MacOS/SidePulseNative" ]; then
     exit 1
 fi
 
-exec /usr/bin/open "$APP" --args --copilot-testing --show-hooks
+exec /usr/bin/open "$APP" --args "$@"

@@ -46,6 +46,7 @@ final class PresentationTests: XCTestCase {
             ("remote", { $0.remoteID = "host-two" }),
             ("remote agent", { $0.remoteAgentName = "opencode" }),
             ("terminal", { $0.remoteTerminalID = "terminal-two" }),
+            ("settling deadline", { $0.postToolUseSettlesAt = self.now.addingTimeInterval(120) }),
             ("permission", { $0.pendingPermissions.insert("permission-one") })
         ]
         for (name, mutate) in mutations {

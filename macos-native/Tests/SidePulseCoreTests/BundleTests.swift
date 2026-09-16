@@ -115,6 +115,35 @@ final class BundleTests: XCTestCase {
         }
         _ = try assertState("Idle")
 
+        _ = try request("clear")
+        let lastToolAt = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down) - 115)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        try send("PostToolUse", id: "missing-stop", extra: [
+            "logged_at": .string(formatter.string(from: lastToolAt)),
+            "tool_response": .object(["success": .bool(true)])
+        ])
+        XCTAssertEqual(try assertState("Working")["activeCount"]?.number, 1)
+        func waitForState(_ state: String) throws -> JSONValue {
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                if try request("snapshot")["ui"]?["label"]?.string == state { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            return try assertState(state)
+        }
+        let inferredDone = try waitForState("Done")
+        XCTAssertEqual(inferredDone["activeCount"]?.number, 0)
+        XCTAssertEqual(inferredDone["sessions"]?.array?.first?["mode"]?.string, "completed")
+        XCTAssertEqual(inferredDone["sessions"]?.array?.first?["event"]?.string, "PostToolUse")
+        XCTAssertEqual(try waitForState("Idle")["activeCount"]?.number, 0)
+        let inferredHistory = try XCTUnwrap(Persistence.load([HistoryEntry].self, from: paths.history))
+        XCTAssertEqual(inferredHistory.suffix(3).map(\.state), [.working, .done, .idle])
+        let rawTool = try XCTUnwrap(Persistence.load([AgentSession].self, from: paths.sessions)?.first)
+        XCTAssertEqual(rawTool.mode, .working)
+        XCTAssertEqual(rawTool.updatedAt.timeIntervalSince(lastToolAt), 0, accuracy: 0.001)
+        XCTAssertEqual(rawTool.postToolUseSettlesAt?.timeIntervalSince(rawTool.updatedAt), 120)
+
         try send("Stop", id: "question", extra: ["last_assistant_message": .string("Which environment should I use?")])
         _ = try assertState("Ask")
         for action in ["capture", "capture-settings", "capture-hooks", "capture-devices", "capture-remotes", "capture-history"] {
@@ -153,6 +182,9 @@ final class BundleTests: XCTestCase {
         XCTAssertNotEqual(replayed["state"]?.string, "Ask")
         let completed = replayed["sessions"]?.array?.first { $0["sessionID"]?.string == "question" }
         XCTAssertEqual(completed?["message"]?.string, "Finished while the application was closed.")
+        let restoredTool = replayed["sessions"]?.array?.first { $0["sessionID"]?.string == "missing-stop" }
+        XCTAssertEqual(restoredTool?["mode"]?.string, "idle_ready", "Restart must not reset the inferred completion window.")
+        XCTAssertEqual(restoredTool?["postToolUseSettlesAt"], inferredDone["sessions"]?.array?.first?["postToolUseSettlesAt"])
         XCTAssertTrue(try PendingEvents.files(socket: paths.socket).isEmpty)
         XCTAssertEqual(replayed["mode"]?.string, "copilot-testing")
         XCTAssertEqual(replayed["systemChangesAllowed"]?.bool, false)

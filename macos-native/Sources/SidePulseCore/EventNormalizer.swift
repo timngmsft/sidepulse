@@ -7,6 +7,8 @@ public struct NormalizedEvent: Sendable {
 }
 
 public enum EventNormalizer {
+    private static let postToolUseSettlingSeconds: TimeInterval = 2 * 60
+
     public static func canonicalName(_ name: String) -> String {
         let key = name.lowercased().filter { $0.isLetter || $0.isNumber }
         switch key {
@@ -48,26 +50,30 @@ public enum EventNormalizer {
         let notification = raw.text("notification_type", "notificationType")
         let copilotNotification = provider == .copilot && event == "Notification" && notification != nil
         let needsAttention = ["permission_prompt", "elicitation_dialog"].contains(notification ?? "")
-        let mode = copilotNotification && needsAttention ? AgentMode.waiting : try mode(for: event, raw: raw, message: message)
+        let explicit = explicitMode(raw: raw, message: message)
+        let mode = copilotNotification && needsAttention ? AgentMode.waiting : try explicit ?? mode(for: event, raw: raw, message: message)
         let eventTime = provider == .copilot ? parseDate(raw["timestamp"]) : nil
         let timestamp = eventTime ?? parseDate(outer["logged_at"] ?? raw["logged_at"] ?? raw["timestamp"]) ?? now
         let title = raw.text("session_title", "sessionTitle")
             ?? (provider == .copilot && event == "Notification" ? nil : raw.text("title"))
             ?? cwd.map { URL(fileURLWithPath: $0).lastPathComponent }
             ?? "\(provider.title) \(String((sessionID ?? agentID ?? "session").prefix(8)))"
-        let session = AgentSession(
+        var session = AgentSession(
             id: "\(provider.rawValue):\(key)", provider: provider, sessionID: sessionID,
             title: String(title.prefix(100)), cwd: cwd, mode: mode,
             updatedAt: min(timestamp, now), observedAt: min(timestamp, now), event: event,
             message: message.map { String($0.prefix(2000)) }, tool: raw.text("tool_name", "toolName")
         )
+        if event == "PostToolUse", mode == .working, explicit == nil {
+            session.postToolUseSettlesAt = session.updatedAt.addingTimeInterval(postToolUseSettlingSeconds)
+        }
         let permissionKey = raw.text("tool_use_id", "toolUseId", "tool_call_id", "toolCallId", "call_id")
             ?? raw.text("tool_name", "toolName")
         return NormalizedEvent(session: session, permissionKey: permissionKey,
                                updatesStatus: !copilotNotification || needsAttention)
     }
 
-    private static func mode(for event: String, raw: [String: JSONValue], message: String?) throws -> AgentMode {
+    private static func explicitMode(raw: [String: JSONValue], message: String?) -> AgentMode? {
         if let value = raw.text("sidepulse_status", "sidepulse_mode"), let explicit = AgentMode.parse(value) {
             return explicit
         }
@@ -82,6 +88,10 @@ public enum EventNormalizer {
                    let explicit = AgentMode.parse(marker.trimmingCharacters(in: .whitespaces)) { return explicit }
             }
         }
+        return nil
+    }
+
+    private static func mode(for event: String, raw: [String: JSONValue], message: String?) throws -> AgentMode {
         switch event {
         case "SessionStart": return .idle
         case "SessionEnd": return raw.text("reason") == "error" ? .blocked : .completed

@@ -63,6 +63,7 @@ final class DeviceService {
     private lazy var output = LEDOutput { [weak self] id, error in
         Task { @MainActor in self?.onError?("LED output (\(id)): \(error.localizedDescription)") }
     }
+    var diagnostics: [String: JSONValue] { output.diagnostics }
 
     func discover() -> [MountedDevice] {
         let volumes = FileManager.default.mountedVolumeURLs(
@@ -80,13 +81,30 @@ final class DeviceService {
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    func apply(devices: [MountedDevice], programs: [String: String], force: Bool = false) {
+    func apply(devices: [MountedDevice], programs: [String: String], force: Bool = false, keepAlive: Bool = true) {
         var targets: [String: LEDTarget] = [:]
+        var connected: [String: URL] = [:]
         for device in devices {
+            let file = device.root.appendingPathComponent("LEDS.LED")
+            connected[device.id] = file
             guard let program = programs[device.id] else { continue }
-            targets[device.id] = LEDTarget(file: device.root.appendingPathComponent("LEDS.LED"), program: program)
+            targets[device.id] = LEDTarget(file: file, program: program)
         }
-        output.apply(targets, force: force)
+        output.apply(targets, connected: connected, force: force, keepAlive: keepAlive)
+    }
+
+    func stop(completion: @escaping @MainActor () -> Void) {
+        output.stop { [weak self] drained in
+            RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
+                MainActor.assumeIsolated {
+                    if !drained {
+                        self?.onError?("SidePulse LED output did not finish before the shutdown deadline.")
+                    }
+                    completion()
+                }
+            }
+            CFRunLoopWakeUp(CFRunLoopGetMain())
+        }
     }
 }
 

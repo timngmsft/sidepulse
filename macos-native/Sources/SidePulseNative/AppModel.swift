@@ -106,7 +106,8 @@ final class AppModel: ObservableObject {
         notice = mode.explanation
     }
 
-    func stop() {
+    func stop(completion: (@MainActor () -> Void)? = nil) {
+        guard !quitting else { completion?(); return }
         quitting = true
         tickTimer?.invalidate(); batteryTimer?.invalidate()
         server?.stop(); server = nil
@@ -123,6 +124,7 @@ final class AppModel: ObservableObject {
             try Persistence.save(store.persistentSessions, to: paths.sessions)
             try Persistence.save(history, to: paths.history)
         } catch { log(error.localizedDescription) }
+        devicesService.stop { completion?() }
     }
 
     @discardableResult
@@ -346,6 +348,19 @@ final class AppModel: ObservableObject {
                     object["systemChangesAllowed"] = .bool(!mode.restrictsSystemChanges)
                     object["remotesAllowed"] = .bool(mode.permitsRemotes)
                     object["remotes"] = try JSONDecoder().decode(JSONValue.self, from: JSONCoding.encoder().encode(remoteStatus.values))
+                    object["hardware"] = .object([
+                        "enabled": .bool(configuration.physicalLEDsEnabled),
+                        "allowed": .bool(!development),
+                        "devices": .array(devices.map { device in
+                            let preference = configuration.devices[device.id] ?? DevicePreference()
+                            return .object([
+                                "name": .string(device.name), "path": .string(device.root.path),
+                                "ledCount": .number(Double(device.count)), "enabled": .bool(preference.enabled),
+                                "display": .string(preference.display.rawValue), "brightness": .number(preference.brightness)
+                            ])
+                        }),
+                        "output": .object(devicesService.diagnostics)
+                    ])
                     object["ok"] = .bool(true)
                     return try JSONEncoder().encode(JSONValue.object(object))
                 case "clear" where development:
@@ -460,6 +475,7 @@ final class AppModel: ObservableObject {
     }
 
     private func applyDevicePrograms(force: Bool = false) {
+        guard !quitting else { return }
         var programs: [String: String] = [:]
         if configuration.physicalLEDsEnabled && !development {
             for device in devices {
@@ -478,7 +494,7 @@ final class AppModel: ObservableObject {
                 }
             }
         }
-        devicesService.apply(devices: devices, programs: programs, force: force)
+        devicesService.apply(devices: devices, programs: programs, force: force, keepAlive: !sleeping)
     }
 
     private var remoteLogger: (String) -> Void {

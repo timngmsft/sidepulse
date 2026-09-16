@@ -259,6 +259,8 @@ struct SettingsView: View {
                     Text("5 minutes").tag(300.0)
                     Text("20 minutes").tag(1200.0)
                 }
+                Text("If the final completion hook is missed, successful local tool activity settles to Done after two quiet minutes. Explicit statuses and pending approvals are preserved; the stale timeout still applies.")
+                    .font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button("Open Native Data Folder") { model.revealState() }
                     Button("Clear Sessions") { model.clearSessions() }
@@ -310,7 +312,7 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Toggle("Enable physical LED output", isOn: binding(\.physicalLEDsEnabled)).disabled(model.development)
-                Text("Leave this off while the original SidePulse app controls the same hardware.")
+                Text("Mirror activity to mounted SidePulse Pro or Dot devices. Disabling output turns off the LEDs and releases the devices. Keep other device-controlling apps closed while output is enabled.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Prevent SidePulse Pro software ejects while this app runs", isOn: binding(\.ejectPreventionEnabled))
                     .disabled(model.development)

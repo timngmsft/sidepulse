@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var historyWindow: NSWindow?
     private var welcomeWindow: NSWindow?
+    private var terminationPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let args = CommandLine.arguments
@@ -56,7 +57,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return try self.capture(kind: kind)
             }
             try model.start()
-            if args.contains("--show-remotes") {
+            if args.contains("--show-devices") {
+                model.settingsSection = .devices
+                openSettings()
+            } else if args.contains("--show-remotes") {
                 model.settingsSection = .remotes
                 openSettings()
             } else if args.contains("--show-hooks") {
@@ -71,6 +75,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.runModal()
             NSApp.terminate(nil)
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model else { return .terminateNow }
+        guard !terminationPending else { return .terminateLater }
+        terminationPending = true
+        model.stop { sender.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
