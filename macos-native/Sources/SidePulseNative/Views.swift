@@ -40,18 +40,26 @@ struct DashboardView: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    if model.snapshot.sessions.isEmpty {
+                    if let emptyState = model.dashboardEmptyState {
                         VStack(spacing: 12) {
                             Image(systemName: "waveform.path").font(.system(size: 35)).foregroundStyle(.secondary)
-                            Text("Your agents, at a glance").font(.headline)
-                            Text(model.mode == .copilotTesting
-                                 ? "Install GitHub Copilot hooks in Settings, then start a new Copilot CLI session."
-                                 : "Install native hooks in Settings to receive activity from Codex, Claude, GitHub Copilot, and Grok.")
-                                .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                            Button("Set Up Agent Hooks") {
-                                model.settingsSection = .hooks
-                                model.showSettings?()
-                            }.buttonStyle(.borderedProminent)
+                            Text(emptyState == .hookSetup ? "Your agents, at a glance" : "No recent agent activity")
+                                .font(.headline)
+                            if emptyState == .hookSetup {
+                                Text(model.mode == .copilotTesting
+                                     ? "Install GitHub Copilot hooks in Settings, then start a new Copilot CLI session."
+                                     : "Install native hooks in Settings to receive activity from Codex, Claude, GitHub Copilot, and Grok.")
+                                    .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                                Button("Set Up Agent Hooks") {
+                                    model.settingsSection = .hooks
+                                    model.showSettings?()
+                                }.buttonStyle(.borderedProminent)
+                            } else {
+                                Text(model.mode.permitsSimulation
+                                     ? "Use the preview buttons to simulate agent activity."
+                                     : "Sessions will appear here when an agent reports activity.")
+                                    .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            }
                         }.frame(maxWidth: .infinity).padding(.vertical, 28)
                     } else {
                         ForEach(model.snapshot.listSections) { section in
@@ -274,14 +282,16 @@ struct SettingsView: View {
             Section {
                 Text("Agent hooks call a small bundled native executable. Neither Python nor the existing sidepulse command is used.")
                 ForEach(Provider.hookProviders) { provider in
+                    let installed = model.installedHooks[provider]
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(provider.title).font(.headline)
                             Text(model.mode.permitsHookChanges(for: provider)
-                                 ? (model.installedHooks[provider] == true ? "Native hooks installed" : "Not installed")
+                                 ? (installed.map { $0 ? "Native hooks installed" : "Not installed" }
+                                    ?? "Installation status unavailable")
                                  : "Disabled in this mode")
                                 .font(.caption).foregroundStyle(.secondary)
-                            if provider == .copilot && model.installedHooks[provider] == true {
+                            if provider == .copilot && installed == true {
                                 if let latest = model.snapshot.sessions.filter({ $0.provider == .copilot })
                                     .max(by: { $0.updatedAt < $1.updatedAt }) {
                                     Text("Last event: \(latest.event)").font(.caption).foregroundStyle(.secondary)
@@ -292,10 +302,14 @@ struct SettingsView: View {
                             }
                         }
                         Spacer()
-                        if model.installedHooks[provider] == true {
-                            Button("Remove") { model.installHooks(provider, removing: true) }
+                        if let installed {
+                            if installed {
+                                Button("Remove") { model.installHooks(provider, removing: true) }
+                            }
+                            Button(installed ? "Update" : "Install") { model.installHooks(provider) }
+                        } else {
+                            Button("Check Again") { model.refreshHooks() }
                         }
-                        Button(model.installedHooks[provider] == true ? "Update" : "Install") { model.installHooks(provider) }
                     }.disabled(!model.mode.permitsHookChanges(for: provider))
                 }
                 Text("Existing hooks are preserved. Configurations are backed up before changes. Restart the agent after installing; Codex may ask you to approve the new hooks.")

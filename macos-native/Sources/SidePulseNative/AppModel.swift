@@ -60,6 +60,10 @@ final class AppModel: ObservableObject {
 
     var helper: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/SidePulseHook") }
     var loginEnabled: Bool { [.enabled, .requiresApproval].contains(SMAppService.mainApp.status) }
+    var dashboardEmptyState: DashboardEmptyState? {
+        guard snapshot.sessions.isEmpty else { return nil }
+        return DashboardEmptyState(mode: mode, installedHooks: installedHooks, hasRemotes: !configuration.remotes.isEmpty)
+    }
 
     func start() throws {
         devicesService.onError = { [weak self] message in self?.report(message) }
@@ -103,7 +107,7 @@ final class AppModel: ObservableObject {
         batteryTimer?.tolerance = 5
         if let batteryTimer { RunLoop.main.add(batteryTimer, forMode: .common) }
         log("Started standalone native app; socket=\(paths.socket.path)")
-        notice = mode.explanation
+        if notice == nil { notice = mode.explanation }
     }
 
     func stop(completion: (@MainActor () -> Void)? = nil) {
@@ -183,8 +187,11 @@ final class AppModel: ObservableObject {
         for provider in Provider.hookProviders where mode != .copilotTesting || provider == .copilot {
             do {
                 hookFiles[provider] = try HookConfiguration.file(for: provider, home: FileManager.default.homeDirectoryForCurrentUser)
-                installedHooks[provider] = HookConfiguration.isInstalled(provider: provider, home: FileManager.default.homeDirectoryForCurrentUser)
-            } catch { report(error.localizedDescription) }
+                installedHooks[provider] = try HookConfiguration.isInstalled(provider: provider, home: FileManager.default.homeDirectoryForCurrentUser)
+            } catch {
+                installedHooks[provider] = nil
+                report("Could not check \(provider.title) hooks: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -342,6 +349,10 @@ final class AppModel: ObservableObject {
                     var object = try JSONDecoder().decode(JSONValue.self, from: encoded).object ?? [:]
                     object["ui"] = .object(renderDiagnostics?() ?? [:])
                     object["mode"] = .string(mode.rawValue)
+                    object["dashboardEmptyState"] = dashboardEmptyState.map { .string($0.rawValue) } ?? .null
+                    object["installedHooks"] = .object(Dictionary(uniqueKeysWithValues: Provider.hookProviders.map {
+                        ($0.rawValue, installedHooks[$0].map(JSONValue.bool) ?? .null)
+                    }))
                     object["hookChangesAllowed"] = .object(Dictionary(uniqueKeysWithValues: Provider.allCases.map {
                         ($0.rawValue, .bool(mode.permitsHookChanges(for: $0)))
                     }))

@@ -15,6 +15,53 @@ final class PresentationTests: XCTestCase {
         MonitorSnapshot(state: .working, sessions: sessions, activeCount: sessions.count, generatedAt: now)
     }
 
+    private var missingHooks: [Provider: Bool] {
+        Dictionary(uniqueKeysWithValues: Provider.hookProviders.map { ($0, false) })
+    }
+
+    func testHookSetupRequiresAllAvailableProvidersToBeConfirmedMissing() {
+        var checked: [Provider: Bool] = [:]
+        for provider in Provider.hookProviders {
+            XCTAssertEqual(DashboardEmptyState(mode: .standard, installedHooks: checked, hasRemotes: false), .noActivity)
+            checked[provider] = false
+        }
+        XCTAssertEqual(DashboardEmptyState(mode: .standard, installedHooks: checked, hasRemotes: false), .hookSetup)
+        checked[.copilot] = nil
+        XCTAssertEqual(DashboardEmptyState(mode: .standard, installedHooks: checked, hasRemotes: false), .noActivity)
+    }
+
+    func testAnyInstalledHookSuppressesSetupWithoutRequiringOtherProviders() {
+        for provider in Provider.hookProviders {
+            var checked = missingHooks
+            checked[provider] = true
+            XCTAssertEqual(DashboardEmptyState(mode: .standard, installedHooks: checked, hasRemotes: false), .noActivity)
+            XCTAssertEqual(DashboardEmptyState(mode: .standard, installedHooks: [provider: true], hasRemotes: false), .noActivity)
+        }
+    }
+
+    func testConfiguredRemotesSuppressHookSetup() {
+        for mode in [ApplicationMode.standard, .copilotTesting] {
+            for checked in [[:], missingHooks] {
+                XCTAssertEqual(DashboardEmptyState(mode: mode, installedHooks: checked, hasRemotes: true), .noActivity)
+            }
+        }
+    }
+
+    func testPreviewNeverOffersHookSetup() {
+        for checked in [[:], missingHooks, [.copilot: true]] {
+            XCTAssertEqual(DashboardEmptyState(mode: .preview, installedHooks: checked, hasRemotes: false), .noActivity)
+        }
+    }
+
+    func testRestrictedModeOnlyUsesCopilotInstallationStatus() {
+        var checked: [Provider: Bool] = [.codex: true, .claude: true, .grok: true]
+        XCTAssertEqual(DashboardEmptyState(mode: .copilotTesting, installedHooks: checked, hasRemotes: false), .noActivity)
+        checked[.copilot] = false
+        XCTAssertEqual(DashboardEmptyState(mode: .copilotTesting, installedHooks: checked, hasRemotes: false), .hookSetup)
+        checked[.copilot] = true
+        XCTAssertEqual(DashboardEmptyState(mode: .copilotTesting, installedHooks: checked, hasRemotes: false), .noActivity)
+    }
+
     func testHeartbeatTimesAndHeartbeatOnlyReorderingDoNotChangePresentation() {
         var second = session
         second.id = "remote:two"

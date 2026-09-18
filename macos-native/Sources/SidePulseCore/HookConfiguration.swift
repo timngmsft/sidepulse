@@ -107,9 +107,31 @@ public enum HookConfiguration {
         return String(decoding: try encoder.encode(JSONValue.object(root)), as: UTF8.self) + "\n"
     }
 
-    public static func isInstalled(provider: Provider, home: URL) -> Bool {
-        guard let text = try? String(contentsOf: file(for: provider, home: home), encoding: .utf8) else { return false }
-        return provider == .codex ? text.contains(markerStart) : text.contains("# sidepulse-native")
+    public static func isInstalled(provider: Provider, home: URL) throws -> Bool {
+        let file = try file(for: provider, home: home)
+        let text: String
+        do {
+            text = try String(contentsOf: file, encoding: .utf8)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return false
+        }
+        if provider == .codex {
+            guard let range = try managedBlockRange(in: text) else { return false }
+            return text[range].contains("# sidepulse-native")
+        }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        let value = try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))
+        guard let root = value.object else { throw NativeError("Hook configuration must be a JSON object.") }
+        guard let configured = root["hooks"] else { return false }
+        guard let hooks = configured.object else { throw NativeError("Existing hooks field is not an object.") }
+        var installed = false
+        for value in hooks.values {
+            guard let entries = value.array else { throw NativeError("Existing hook entries must be arrays.") }
+            for entry in entries {
+                if try containsNativeCommand(entry) { installed = true }
+            }
+        }
+        return installed
     }
 
     public static func install(provider: Provider, home: URL, helper: URL, socket: URL,
@@ -147,9 +169,23 @@ public enum HookConfiguration {
         "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    private static func isNativeCommand(_ entry: JSONValue) -> Bool {
+        (entry["command"]?.string ?? entry["bash"]?.string)?.hasSuffix("# sidepulse-native") == true
+    }
+
+    private static func containsNativeCommand(_ entry: JSONValue) throws -> Bool {
+        guard entry.object != nil else { throw NativeError("Hook entries must be JSON objects.") }
+        var installed = isNativeCommand(entry)
+        guard let nested = entry["hooks"] else { return installed }
+        guard let children = nested.array else { throw NativeError("Nested hook entries must be arrays.") }
+        for child in children {
+            if try containsNativeCommand(child) { installed = true }
+        }
+        return installed
+    }
+
     private static func removingNativeCommands(_ entry: JSONValue) -> JSONValue? {
-        if let text = entry["command"]?.string ?? entry["bash"]?.string,
-           text.hasSuffix("# sidepulse-native") { return nil }
+        if isNativeCommand(entry) { return nil }
         if var object = entry.object, let children = object["hooks"]?.array {
             let remaining = children.compactMap(removingNativeCommands)
             if remaining.isEmpty { return nil }
@@ -176,13 +212,18 @@ public enum HookConfiguration {
         }
     }
 
-    private static func stripManagedBlock(_ original: String) throws -> String {
-        guard let start = original.range(of: markerStart) else { return original }
+    private static func managedBlockRange(in original: String) throws -> Range<String.Index>? {
+        guard let start = original.range(of: markerStart) else { return nil }
         guard let end = original.range(of: markerEnd, range: start.upperBound..<original.endIndex) else {
             throw NativeError("The existing native hook block is incomplete; restore its backup before updating.")
         }
+        return start.lowerBound..<end.upperBound
+    }
+
+    private static func stripManagedBlock(_ original: String) throws -> String {
+        guard let range = try managedBlockRange(in: original) else { return original }
         var output = original
-        output.removeSubrange(start.lowerBound..<end.upperBound)
+        output.removeSubrange(range)
         return output.trimmingCharacters(in: .newlines) + "\n"
     }
 

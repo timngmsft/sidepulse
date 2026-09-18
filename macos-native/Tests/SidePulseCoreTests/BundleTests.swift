@@ -14,9 +14,13 @@ final class BundleTests: XCTestCase {
         var configuration = AppConfiguration()
         configuration.doneVisibleSeconds = 2.5
         try Persistence.save(configuration, to: paths.configuration)
+        let home = root.appendingPathComponent("fixture-home")
+        var environment = ProcessInfo.processInfo.environment
+        environment["COPILOT_HOME"] = home.appendingPathComponent(".copilot").path
         let process = Process()
         process.executableURL = app.appendingPathComponent("Contents/MacOS/SidePulseNative")
         process.arguments = ["--state-dir", root.path, "--development", "--show-window"]
+        process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         let errors = Pipe()
         process.standardError = errors
@@ -73,6 +77,7 @@ final class BundleTests: XCTestCase {
         let initial = try request("snapshot")
         XCTAssertEqual(initial["state"]?.string, "Idle")
         XCTAssertEqual(initial["mode"]?.string, "preview")
+        XCTAssertEqual(initial["dashboardEmptyState"]?.string, "noActivity")
         XCTAssertEqual(initial["hookChangesAllowed"]?["copilot"]?.bool, false)
         let width = initial["ui"]?["width"]?.number
         XCTAssertEqual(width, 96, "The labeled item should fit five LEDs and the widest label without extra outer padding.")
@@ -87,6 +92,7 @@ final class BundleTests: XCTestCase {
 
         try send("UserPromptSubmit")
         let working = try assertState("Working")
+        XCTAssertEqual(working["dashboardEmptyState"], .null)
         XCTAssertEqual(working["ui"]?["animations"]?.number, working["ui"]?["reduceMotion"]?.bool == true ? 0 : 5)
         if working["ui"]?["reduceMotion"]?.bool == false && working["ui"]?["visible"]?.bool == true {
             Thread.sleep(forTimeInterval: 0.35)
@@ -168,6 +174,7 @@ final class BundleTests: XCTestCase {
         let restarted = Process()
         restarted.executableURL = process.executableURL
         restarted.arguments = ["--state-dir", root.path, "--copilot-testing"]
+        restarted.environment = environment
         restarted.standardOutput = FileHandle.nullDevice; restarted.standardError = FileHandle.nullDevice
         defer {
             if restarted.isRunning { restarted.terminate(); restarted.waitUntilExit() }
@@ -193,8 +200,14 @@ final class BundleTests: XCTestCase {
         }
 
         _ = try request("clear")
-        let home = root.appendingPathComponent("fixture-home")
+        let unconfigured = try request("snapshot")
+        XCTAssertEqual(unconfigured["dashboardEmptyState"]?.string, "hookSetup")
+        XCTAssertEqual(unconfigured["installedHooks"]?["copilot"]?.bool, false)
         let install = try HookConfiguration.install(provider: .copilot, home: home, helper: helper, socket: paths.socket)
+        _ = try request("capture")
+        let configured = try request("snapshot")
+        XCTAssertEqual(configured["dashboardEmptyState"]?.string, "noActivity")
+        XCTAssertEqual(configured["installedHooks"]?["copilot"]?.bool, true)
         let hookConfiguration = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: install.file))
         func runConfiguredCopilotHook(_ event: String, _ body: [String: JSONValue]) throws {
             let command = try XCTUnwrap(hookConfiguration["hooks"]?[event]?.array?.last?["bash"]?.string)
@@ -243,7 +256,18 @@ final class BundleTests: XCTestCase {
         _ = try assertState("Done")
         _ = try request("capture-hooks")
         _ = try HookConfiguration.install(provider: .copilot, home: home, helper: helper, socket: paths.socket, removing: true)
-        XCTAssertFalse(HookConfiguration.isInstalled(provider: .copilot, home: home))
+        XCTAssertFalse(try HookConfiguration.isInstalled(provider: .copilot, home: home))
+        _ = try request("clear")
+        _ = try request("capture")
+        XCTAssertEqual(try request("snapshot")["dashboardEmptyState"]?.string, "hookSetup")
+        try Data("invalid JSON".utf8).write(to: install.file, options: .atomic)
+        _ = try request("capture-hooks")
+        let unknown = try request("snapshot")
+        XCTAssertEqual(unknown["dashboardEmptyState"]?.string, "noActivity")
+        XCTAssertEqual(unknown["installedHooks"]?["copilot"], .null)
+        try FileManager.default.removeItem(at: install.file)
+        _ = try request("capture")
+        XCTAssertEqual(try request("snapshot")["dashboardEmptyState"]?.string, "hookSetup")
         _ = try request("quit")
         restarted.waitUntilExit()
     }

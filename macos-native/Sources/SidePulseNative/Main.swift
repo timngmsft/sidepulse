@@ -137,6 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func openWelcome() {
         guard let model else { return }
+        model.refreshHooks()
         if welcomeWindow == nil {
             welcomeWindow = window(title: "SidePulse Native", size: NSSize(width: 420, height: 500), root: DashboardView(model: model))
             welcomeWindow?.styleMask.remove(.resizable)
@@ -145,6 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func openSettings() {
         guard let model else { return }
+        model.refreshHooks()
         if settingsWindow == nil {
             settingsWindow = window(title: "SidePulse Native Settings", size: NSSize(width: 690, height: 600), root: SettingsView(model: model))
         }

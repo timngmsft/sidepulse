@@ -291,7 +291,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: file.path)[.type] as? FileAttributeType, .typeSymbolicLink)
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
         XCTAssertEqual(try Data(contentsOf: XCTUnwrap(installed.backup)), original)
-        XCTAssertTrue(HookConfiguration.isInstalled(provider: .claude, home: root))
+        XCTAssertTrue(try HookConfiguration.isInstalled(provider: .claude, home: root))
 
         let grok = try HookConfiguration.install(provider: .grok, home: root, helper: helper, socket: socket)
         let hooks = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: grok.file))["hooks"]

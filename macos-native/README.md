@@ -118,6 +118,12 @@ open "macos-native/dist/SidePulse Native.app" --args --copilot-testing --show-re
 
 To receive real activity, open the app normally and explicitly install the desired provider's hooks from **Settings > Agent Hooks**. Restart that agent afterward. Codex may require approving the new hooks. Native installation preserves existing SidePulse hooks, so both apps can observe activity while comparing them. Keep only one app in control of a physical device.
 
+## Empty dashboard
+
+An empty session list shows **No recent agent activity** when at least one available provider has native hooks installed or any remote is configured, including disabled remotes. **Set Up Agent Hooks** appears only when every available provider has been checked and has no native hooks, and no remote is configured. Preview mode never offers hook setup; restricted live testing considers only Copilot's hooks.
+
+Installation checks read native command entries in the provider's configuration (the managed block for Codex), respecting `COPILOT_HOME`. They refresh when the menu, dashboard, or Settings window opens and after installing or removing hooks. Unreadable files, invalid JSON hook structures, and incomplete Codex managed blocks are reported as unknown, not uninstalled: the dashboard stays neutral and Agent Hooks offers **Check Again**. These checks establish configuration presence, not whether the agent has restarted or successfully delivered an event.
+
 ## Local completion fallback
 
 If a final `Stop` hook is missed, an implicit local `PostToolUse` Working state settles to **Done** after two minutes without a newer status event. This applies to Codex, Claude, GitHub Copilot, and Grok. A new tool start, prompt, question, or other status event supersedes the fallback; another successful tool completion starts a new settling interval. Explicit status fields or message markers, pending approvals, recognized errors, and remote Herdr activity are not auto-completed.
@@ -151,6 +157,8 @@ Core XCTest coverage includes event normalization, question detection, aggregati
 Post-tool settling coverage checks the exact two-minute boundary, all completion-duration choices, explicit fields and message markers, pending permissions, new and delayed events, aggregation, stale expiry, and persistence compatibility. The bundled app also exercises Working / Done / Idle without a final Stop, including timed UI updates, completion-animation settling, history, and restart behavior.
 
 Presentation coverage verifies that heartbeat-only timestamps and ordering do not invalidate the UI while content changes and timed expiry still do. The bundled Herdr case checks that raw heartbeat timestamps keep advancing without application-wide UI notifications; the read-only `ui.modelUpdates` snapshot counter supports that check.
+
+Empty-dashboard coverage checks installed, missing, and unknown hooks, remote-only configuration, and preview/restricted modes. Hook fixtures cover all four local providers, unrelated markers, malformed configurations, and read failures. The bundled app observes fixture Copilot hook installation, removal, and failed checks without modifying real agent configuration; read-only snapshots expose `installedHooks` (null when unknown) and `dashboardEmptyState` (null while sessions are visible).
 
 Hardware coverage checks in-place writes, device release, unplug/reconnect cancellation, retry recovery, keepalive ownership, and bounded shutdown without touching real devices.
 

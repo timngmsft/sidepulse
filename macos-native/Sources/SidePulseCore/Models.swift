@@ -187,6 +187,16 @@ public struct SessionListSection: Identifiable {
     public var id: String { title }
 }
 
+public enum DashboardEmptyState: String, Sendable {
+    case noActivity, hookSetup
+
+    public init(mode: ApplicationMode, installedHooks: [Provider: Bool], hasRemotes: Bool) {
+        let providers = Provider.hookProviders.filter { mode.permitsHookChanges(for: $0) }
+        self = !providers.isEmpty && !(mode.permitsRemotes && hasRemotes)
+            && providers.allSatisfy { installedHooks[$0] == false } ? .hookSetup : .noActivity
+    }
+}
+
 public struct MonitorSnapshot: Codable, Sendable {
     public var state: DisplayState
     public var sessions: [AgentSession]
