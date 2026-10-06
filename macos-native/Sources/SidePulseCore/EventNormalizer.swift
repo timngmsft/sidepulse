@@ -64,6 +64,13 @@ public enum EventNormalizer {
             updatedAt: min(timestamp, now), observedAt: min(timestamp, now), event: event,
             message: message.map { String($0.prefix(2000)) }, tool: raw.text("tool_name", "toolName")
         )
+        if provider == .copilot {
+            session.copilotEventLog = raw.text("sidepulse_copilot_event_log")
+            if event == "SessionEnd", raw.text("reason") == "abort" {
+                session.event = CopilotSessionSignal.Kind.aborted.event
+                session.mode = .idle
+            }
+        }
         if event == "PostToolUse", mode == .working, explicit == nil {
             session.postToolUseSettlesAt = session.updatedAt.addingTimeInterval(postToolUseSettlingSeconds)
         }

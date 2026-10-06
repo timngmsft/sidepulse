@@ -46,6 +46,7 @@ final class BundleTests: XCTestCase {
 
         func runHelper(_ arguments: [String], input: Data? = nil, expectedExit: Int32 = 0) throws -> Data {
             let child = Process()
+            child.environment = environment
             child.executableURL = helper
             child.arguments = ["--socket", paths.socket.path, "--strict"] + arguments
             let output = Pipe(), error = Pipe()
@@ -212,6 +213,7 @@ final class BundleTests: XCTestCase {
         func runConfiguredCopilotHook(_ event: String, _ body: [String: JSONValue]) throws {
             let command = try XCTUnwrap(hookConfiguration["hooks"]?[event]?.array?.last?["bash"]?.string)
             let hook = Process()
+            hook.environment = environment
             let input = Pipe(), output = Pipe(), error = Pipe()
             hook.executableURL = URL(fileURLWithPath: "/bin/sh")
             hook.arguments = ["-c", command]

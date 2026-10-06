@@ -2,6 +2,9 @@ import Foundation
 
 // The owner serializes access; the app owns this store on the main actor.
 public final class SessionStore {
+    private static let copilotCleanupEvents: Set<String> = [
+        "PostToolUse", "PostToolUseFailure", "PermissionDenied", "Stop", "StopFailure", "ErrorOccurred", "SessionEnd"
+    ]
     private var sessionsByID: [String: AgentSession] = [:]
     public var staleAfter: TimeInterval = 3600
     public var doneVisible: TimeInterval = 1200
@@ -16,15 +19,30 @@ public final class SessionStore {
         guard event.updatesStatus else { return false }
         var incoming = event.session
         if let previous = sessionsByID[incoming.id] {
-            guard incoming.updatedAt >= previous.updatedAt else { return false }
+            let cutoff = incoming.isCancelled ? previous.copilotCancellationCutoff : previous.updatedAt
+            guard incoming.updatedAt >= cutoff else { return false }
+            if previous.isCancelled, Self.copilotCleanupEvents.contains(incoming.event) { return false }
             incoming.pendingPermissions = previous.pendingPermissions
             if incoming.cwd == nil { incoming.cwd = previous.cwd }
+            if incoming.copilotEventLog == nil { incoming.copilotEventLog = previous.copilotEventLog }
+            if incoming.isLocalCopilotSession {
+                incoming.copilotActivityAt = previous.copilotActivityAt ?? previous.updatedAt
+            }
             if incoming.title.hasPrefix("\(incoming.provider.title) ") { incoming.title = previous.title }
             if incoming.message == nil && !["SessionStart", "UserPromptSubmit"].contains(incoming.event) {
                 incoming.message = previous.message
             }
         }
-        if ["SessionStart", "UserPromptSubmit", "SessionEnd"].contains(incoming.event) {
+        if incoming.isLocalCopilotSession, !incoming.isCancelled,
+           !Self.copilotCleanupEvents.contains(incoming.event) {
+            incoming.copilotActivityAt = incoming.updatedAt
+        }
+        if incoming.isCancelled {
+            incoming.pendingPermissions.removeAll()
+            incoming.postToolUseSettlesAt = nil
+            incoming.message = nil
+            incoming.tool = nil
+        } else if ["SessionStart", "UserPromptSubmit", "SessionEnd"].contains(incoming.event) {
             incoming.pendingPermissions.removeAll()
         } else if incoming.event == "PermissionRequest" {
             incoming.pendingPermissions.insert(event.permissionKey ?? "permission")
@@ -41,6 +59,25 @@ public final class SessionStore {
             sessionsByID.removeValue(forKey: oldest.id)
         }
         return true
+    }
+
+    @discardableResult
+    public func ingest(_ signal: CopilotSessionSignal) -> Bool {
+        let id = "copilot:session:\(signal.sessionID)"
+        guard var session = sessionsByID[id], session.isLocalCopilotSession else { return false }
+        let cutoff = signal.kind == .aborted ? session.copilotCancellationCutoff : session.updatedAt
+        guard signal.timestamp >= cutoff else { return false }
+        if let path = session.copilotEventLog,
+           URL(fileURLWithPath: path).standardizedFileURL != signal.file { return false }
+        if signal.kind == .started && !session.isCancelled { return false }
+        if session.event == signal.kind.event && signal.timestamp == session.updatedAt { return false }
+        session.event = signal.kind.event
+        session.mode = signal.kind == .aborted ? .idle : .working
+        session.updatedAt = signal.timestamp
+        session.observedAt = signal.timestamp
+        session.copilotEventLog = signal.file.path
+        session.postToolUseSettlesAt = nil
+        return ingest(NormalizedEvent(session: session, permissionKey: nil))
     }
 
     public func reconcile(remoteID: String, sessions: [AgentSession]) {

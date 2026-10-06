@@ -20,6 +20,9 @@ final class AppModel: ObservableObject {
     let mode: ApplicationMode
     var development: Bool { mode.restrictsSystemChanges }
     private let store: SessionStore
+    private let copilotCancellationReader: CopilotCancellationReader
+    private let copilotCancellationQueue = DispatchQueue(label: "io.sidepulse.native.copilot-cancellation", qos: .utility)
+    private var checkingCopilotCancellations = false
     private let devicesService = DeviceService()
     private let awake = AwakeService()
     private let ejectGuard = EjectGuard()
@@ -46,6 +49,7 @@ final class AppModel: ObservableObject {
     init(paths: NativePaths, mode: ApplicationMode, testSSHExecutable: URL? = nil) throws {
         self.paths = paths; self.mode = mode
         self.testSSHExecutable = testSSHExecutable
+        copilotCancellationReader = CopilotCancellationReader(directory: try CopilotCancellationReader.eventsDirectory())
         try paths.prepare()
         let loaded = try Persistence.load(AppConfiguration.self, from: paths.configuration) ?? AppConfiguration()
         try loaded.validate()
@@ -79,6 +83,7 @@ final class AppModel: ObservableObject {
             try Persistence.save(configuration, to: paths.configuration)
         }
         drainPendingEvents()
+        checkCopilotCancellations()
         refreshHooks()
         refreshDevices()
         refreshBattery()
@@ -97,7 +102,10 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.systemWake() }
         })
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.drainPendingEvents(); self?.checkAuthentications(); self?.refresh() }
+            Task { @MainActor in
+                self?.drainPendingEvents(); self?.checkAuthentications()
+                self?.checkCopilotCancellations(); self?.refresh()
+            }
         }
         tickTimer?.tolerance = 0.2
         if let tickTimer { RunLoop.main.add(tickTimer, forMode: .common) }
@@ -458,6 +466,28 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func checkCopilotCancellations() {
+        guard !quitting, !sleeping, !mode.permitsSimulation, !checkingCopilotCancellations else { return }
+        checkingCopilotCancellations = true
+        let sessions = store.persistentSessions
+        let reader = copilotCancellationReader
+        copilotCancellationQueue.async { [weak self] in
+            let result = reader.poll(sessions)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checkingCopilotCancellations = false
+                guard !self.quitting else { return }
+                for error in result.errors { self.report(error) }
+                guard !self.sleeping else { return }
+                var changed = false
+                for signal in result.signals {
+                    if self.store.ingest(signal) { changed = true }
+                }
+                if changed { self.persistSessions(); self.refresh() }
+            }
+        }
+    }
+
     private func refreshDevices() {
         devices = devicesService.discover()
         applyServices(forceDeviceRefresh: true)
@@ -633,6 +663,7 @@ final class AppModel: ObservableObject {
     private func systemWake() {
         sleeping = false
         synchronizeRemotes()
+        checkCopilotCancellations()
         refreshBattery(); refreshDevices(); refresh()
     }
 

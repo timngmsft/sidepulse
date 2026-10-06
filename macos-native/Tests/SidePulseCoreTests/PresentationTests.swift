@@ -94,6 +94,8 @@ final class PresentationTests: XCTestCase {
             ("remote agent", { $0.remoteAgentName = "opencode" }),
             ("terminal", { $0.remoteTerminalID = "terminal-two" }),
             ("settling deadline", { $0.postToolUseSettlesAt = self.now.addingTimeInterval(120) }),
+            ("Copilot event log", { $0.copilotEventLog = "/tmp/session-state/one/events.jsonl" }),
+            ("Copilot activity watermark", { $0.copilotActivityAt = self.now }),
             ("permission", { $0.pendingPermissions.insert("permission-one") })
         ]
         for (name, mutate) in mutations {

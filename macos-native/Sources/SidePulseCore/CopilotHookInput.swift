@@ -3,7 +3,7 @@ import Foundation
 public enum CopilotHookInput {
     public static let transcriptReadLimit = 262_144
 
-    public static func prepare(_ line: JSONValue, fallbackEvent: String?,
+    public static func prepare(_ line: JSONValue, fallbackEvent: String?, eventsDirectory: URL? = nil,
                                reportMetadataError: ((Error) -> Void)? = nil) throws -> JSONValue {
         guard var outer = line.object else { throw NativeError("Copilot hook input must be a JSON object.") }
         let nested = outer["event"]?.object != nil
@@ -13,6 +13,17 @@ public enum CopilotHookInput {
             let canonical = EventNormalizer.canonicalName(fallbackEvent)
             guard EventNormalizer.events.contains(canonical) else { throw NativeError("Unknown Copilot hook event.") }
             raw["hook_event_name"] = .string(canonical)
+        }
+        if let sessionID = raw.text("session_id", "sessionId", "conversation_id", "conversationId") {
+            do {
+                let directory = try eventsDirectory ?? CopilotCancellationReader.eventsDirectory()
+                raw["sidepulse_copilot_event_log"] = .string(
+                    try CopilotCancellationReader.eventFile(sessionID: sessionID, directory: directory).path
+                )
+            } catch {
+                guard let reportMetadataError else { throw error }
+                reportMetadataError(error)
+            }
         }
         if let name = suppliedEvent ?? fallbackEvent,
            EventNormalizer.canonicalName(name) == "Stop",

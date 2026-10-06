@@ -57,7 +57,7 @@ Click **Install** and confirm the displayed path. This creates or updates only `
 
 Without a `--state-dir` override, this mode uses the normal native data directory and socket. Those hook commands therefore keep working when the app is subsequently opened normally; they do not point into the temporary preview directory.
 
-Copilot hooks use PascalCase event names to select VS Code-compatible input and pass their registered event name as a legacy-format fallback. Permission and question-dialog notifications produce **Ask**; background completion notifications do not end an active or waiting parent session. For a Stop event that lacks reply text, the native helper reads at most the final 256 KiB of the supplied transcript to find the latest assistant reply. This is an on-demand read, not transcript polling or an ML classifier.
+Copilot hooks use PascalCase event names to select VS Code-compatible input and pass their registered event name as a legacy-format fallback. Permission and question-dialog notifications produce **Ask**; background completion notifications do not end an active or waiting parent session. For a Stop event that lacks reply text, the native helper reads at most the final 256 KiB of the supplied transcript to find the latest assistant reply. This reply enrichment is on demand, separate from the cancellation observer below; neither uses an ML classifier.
 
 The hook commands emit no permission decisions and remain non-blocking for Copilot even if the app bundle is moved, removed, or unavailable. Failures are reported to stderr; the running helper queues events when the receiver is offline.
 
@@ -132,12 +132,29 @@ If a final `Stop` hook is missed, an implicit local `PostToolUse` Working state 
 
 This is a missing-hook heuristic, not proof that an agent finished. An agent silently thinking for more than two minutes after a tool completion can therefore appear Done; an explicit Working status suppresses this inference until the next status event. Existing saved sessions lack the information needed to distinguish explicit Working from implicit Working, so they retain their previous expiry behavior until a new hook arrives. Newly received events persist their optional settling deadline for safe restarts.
 
+## Copilot cancellation recovery
+
+Normal and restricted live-testing modes also check the event logs of known local Copilot sessions on the one-second refresh cycle. An explicit root `abort` record changes only that session to **Idle**, labeled **Cancelled** in Recent; it does not produce a green Done indication. A `SessionEnd` hook with `reason: "abort"` has the same result. Late tool-result, error, or Stop cleanup hooks cannot revive a cancelled turn, whether they arrive before or after the cancellation is detected. A persisted activity timestamp distinguishes that cleanup from a genuinely newer prompt, tool start, or question; a root `assistant.turn_start` can also resume a cancelled session.
+
+Each session ID has its own incremental log cursor, including when several instances use the same workspace. The bundled helper supplies the instance's event-log location using its own `COPILOT_HOME`; the path is persisted, so different configuration directories remain independent across app restarts. Older sessions without this metadata fall back to the app's Copilot configuration directory, and those without an activity timestamp conservatively use their last hook time until new activity establishes one. Subagent aborts never cancel the parent, and an older cancellation cannot overwrite newer activity or a newer question.
+
+The menu bar, dashboard ordering, status strip, and agent LEDs retain the shared priority **Ask > Working > Done > Idle**:
+
+| Instances | Aggregate display |
+| --- | --- |
+| Running + cancelled, idle, or completed | Working |
+| Question/approval + running or cancelled | Ask |
+| Completed + cancelled or idle | Done, until the completion duration expires |
+| All cancelled or idle | Idle |
+
+Reads run off the main thread, start with at most the last 256 KiB, and consume at most 256 KiB of new data per session per pass (plus a small cursor-integrity check). Partial records and backlogs must be caught up before a signal is applied; file replacement and truncation reset the cursor. A large backlog can take additional refreshes. Missing, unreadable, malformed, or oversized records are reported rather than interpreted as cancellation. Recovery depends on Copilot writing the structured lifecycle record; otherwise normal hooks and the existing stale timeout remain authoritative. This is not a general transcript-only monitoring fallback, and simulated preview does not read these logs.
+
 ## Scope and limitations
 
 This is a separate native implementation, not a complete migration of every legacy feature:
 
 - It does not import the original application's preferences, hooks, history, or installation state.
-- Local activity requires native hooks. The legacy transcript-only polling fallback is not included. Copilot Stop hooks can read the latest reply from their supplied transcript; other providers use reply text supplied by their hooks.
+- Local activity requires native hooks. The legacy transcript-only polling fallback is not included. Copilot additionally observes explicit cancellation records for already-known local sessions, and its Stop hook can read the latest reply; other providers use reply text supplied by their hooks.
 - Local session actions open the workspace or a terminal; provider-specific resume/deep-link behavior is not yet implemented.
 - The native on-screen strip represents agent state, not a full firmware/WASM custom-program simulator.
 - Keep-awake does not modify global power settings or override closed-lid sleep.
@@ -159,6 +176,8 @@ Post-tool settling coverage checks the exact two-minute boundary, all completion
 Presentation coverage verifies that heartbeat-only timestamps and ordering do not invalidate the UI while content changes and timed expiry still do. The bundled Herdr case checks that raw heartbeat timestamps keep advancing without application-wide UI notifications; the read-only `ui.modelUpdates` snapshot counter supports that check.
 
 Empty-dashboard coverage checks installed, missing, and unknown hooks, remote-only configuration, and preview/restricted modes. Hook fixtures cover all four local providers, unrelated markers, malformed configurations, and read failures. The bundled app observes fixture Copilot hook installation, removal, and failed checks without modifying real agent configuration; read-only snapshots expose `installedHooks` (null when unknown) and `dashboardEmptyState` (null while sessions are visible).
+
+Cancellation coverage includes same-workspace instances, separate Copilot homes, question/working/done/idle priority, pending approvals, late cleanup, newer prompts, root versus subagent events, bounded and partial reads, log replacement, malformed input, and persisted cancellation. A bundled-app scenario runs two isolated hook helpers and verifies actual menu-bar states, active counts, and cancellation while the app is closed, without canceling or modifying any real Copilot session.
 
 Hardware coverage checks in-place writes, device release, unplug/reconnect cancellation, retry recovery, keepalive ownership, and bounded shutdown without touching real devices.
 

@@ -145,6 +145,8 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
     public var pendingPermissions: Set<String> = []
     // Only newly normalized, implicit PostToolUse events opt into completion inference.
     public var postToolUseSettlesAt: Date?
+    public var copilotEventLog: String?
+    public var copilotActivityAt: Date?
 
     public init(id: String, provider: Provider, sessionID: String? = nil, title: String,
                 cwd: String? = nil, mode: AgentMode, updatedAt: Date, observedAt: Date? = nil,
@@ -168,7 +170,12 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
         return mode
     }
 
-    public var statusLabel: String { event == "SessionEnd" ? "Ended" : mode.display.rawValue }
+    public var isLocalCopilotSession: Bool {
+        provider == .copilot && remoteID == nil && sessionID.map { id == "copilot:session:\($0)" } == true
+    }
+    public var isCancelled: Bool { provider == .copilot && event == CopilotSessionSignal.Kind.aborted.event }
+    public var copilotCancellationCutoff: Date { copilotActivityAt ?? updatedAt }
+    public var statusLabel: String { isCancelled ? "Cancelled" : event == "SessionEnd" ? "Ended" : mode.display.rawValue }
     public var providerTitle: String { provider == .herdr ? remoteAgentName ?? provider.title : provider.title }
 
     public var referenceLabel: String? {
