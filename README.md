@@ -287,7 +287,20 @@ python3 -m pip install --user --break-system-packages -e .
 ln -sf "$(python3 -m site --user-base)/bin/sidepulse" ~/.local/bin/sidepulse
 ```
 
-### macOS installer
+### Native macOS release
+
+To build the standalone Swift app without Python or PyObjC:
+
+```sh
+./macos-native/build-release.sh
+```
+
+The app, versioned ZIP, and SHA-256 checksum are written to
+`macos-native/dist/`. The build requires full Xcode and targets the current
+Mac's architecture. See [`macos-native/README.md`](macos-native/README.md#release-build)
+for signing, versioning, and installation details.
+
+### macOS installer (Python app)
 
 A signed and notarized PKG release can be built with
 [`packaging/build_macos_pkg.sh`](packaging/build_macos_pkg.sh). See

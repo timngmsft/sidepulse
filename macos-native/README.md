@@ -21,6 +21,49 @@ The generated `.app` is self-contained and can be copied elsewhere. Put it in it
 
 For Developer ID signing, supply `SIGN_IDENTITY` to `build.sh`. The default ad-hoc signature is for local use; public distribution additionally requires appropriate signing and notarization.
 
+## Release build
+
+For an optimized native app and a versioned archive, run:
+
+```sh
+./macos-native/build-release.sh
+```
+
+This uses the existing native build and bundle assembly, forces Release mode
+even if `CONFIGURATION=debug` is set, and runs the native tests against a
+relocated copy of the app before packaging. Full Xcode is required. The app
+and its bundled hook helper target the current Mac's architecture, not a
+universal Intel/Apple Silicon binary. No Python environment is needed.
+
+The outputs are in `macos-native/dist/`:
+
+- `SidePulse Native.app` -- the standalone application.
+- `SidePulse-Native-<version>-<build>-<architecture>.zip` -- the app bundle,
+  archived with macOS metadata preserved.
+- The matching `.zip.sha256` file -- verify it from that directory with
+  `shasum -a 256 -c <archive>.zip.sha256`.
+
+Set `CFBundleShortVersionString` and `CFBundleVersion` in
+`macos-native/Resources/Info.plist` before building a new release. Rebuilding
+the same version, build, and architecture replaces its ZIP and checksum only
+after the build, tests, and archive creation succeed. The script does not
+install the app, enable login startup, or change real agent hooks. Copy the
+app to its final location before installing or updating hooks.
+
+The default ad-hoc signature is suitable for this Mac. To use an existing
+Developer ID Application identity instead:
+
+```sh
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+  ./macos-native/build-release.sh
+```
+
+Signing alone does not make this a notarized public release. The script does
+not upload anything to Apple; public distribution still requires
+[notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
+`DEVELOPER_DIR` has the same behavior as in `build.sh`; use `--help` for a
+summary of the release command.
+
 ## Safe side-by-side preview
 
 ```sh
