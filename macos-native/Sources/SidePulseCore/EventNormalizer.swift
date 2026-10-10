@@ -1,9 +1,11 @@
+import CryptoKit
 import Foundation
 
 public struct NormalizedEvent: Sendable {
     public var session: AgentSession
     public var permissionKey: String?
     public var updatesStatus = true
+    public var questionKey: String?
 }
 
 public enum EventNormalizer {
@@ -50,8 +52,11 @@ public enum EventNormalizer {
         let notification = raw.text("notification_type", "notificationType")
         let copilotNotification = provider == .copilot && event == "Notification" && notification != nil
         let needsAttention = ["permission_prompt", "elicitation_dialog"].contains(notification ?? "")
+        let tool = raw.text("tool_name", "toolName")
+        let questionTool = provider == .copilot && ["ask_user", "askuserquestion"].contains(tool?.lowercased() ?? "")
         let explicit = explicitMode(raw: raw, message: message)
-        let mode = copilotNotification && needsAttention ? AgentMode.waiting : try explicit ?? mode(for: event, raw: raw, message: message)
+        let waiting = (copilotNotification && needsAttention) || (event == "PreToolUse" && questionTool)
+        let mode = waiting ? AgentMode.waiting : try explicit ?? mode(for: event, raw: raw, message: message)
         let eventTime = provider == .copilot ? parseDate(raw["timestamp"]) : nil
         let timestamp = eventTime ?? parseDate(outer["logged_at"] ?? raw["logged_at"] ?? raw["timestamp"]) ?? now
         let title = raw.text("session_title", "sessionTitle")
@@ -62,7 +67,7 @@ public enum EventNormalizer {
             id: "\(provider.rawValue):\(key)", provider: provider, sessionID: sessionID,
             title: String(title.prefix(100)), cwd: cwd, mode: mode,
             updatedAt: min(timestamp, now), observedAt: min(timestamp, now), event: event,
-            message: message.map { String($0.prefix(2000)) }, tool: raw.text("tool_name", "toolName")
+            message: message.map { String($0.prefix(2000)) }, tool: tool
         )
         if provider == .copilot {
             session.copilotEventLog = raw.text("sidepulse_copilot_event_log")
@@ -74,10 +79,23 @@ public enum EventNormalizer {
         if event == "PostToolUse", mode == .working, explicit == nil {
             session.postToolUseSettlesAt = session.updatedAt.addingTimeInterval(postToolUseSettlingSeconds)
         }
-        let permissionKey = raw.text("tool_use_id", "toolUseId", "tool_call_id", "toolCallId", "call_id")
-            ?? raw.text("tool_name", "toolName")
-        return NormalizedEvent(session: session, permissionKey: permissionKey,
-                               updatesStatus: !copilotNotification || needsAttention)
+        let callID = raw.text("tool_use_id", "toolUseId", "tool_call_id", "toolCallId", "call_id")
+        var questionKey: String?
+        if provider == .copilot {
+            if let callID, questionTool || ["PostToolUse", "PostToolUseFailure", "PermissionDenied"].contains(event) {
+                questionKey = "call:\(callID)"
+            } else if questionTool {
+                // Copilot's file hooks omit call IDs but preserve arguments across start/result events.
+                if let input = raw["tool_input"] ?? raw["toolInput"] ?? raw["toolArgs"] {
+                    let digest = SHA256.hash(data: try JSONCoding.encoder().encode(input))
+                    questionKey = "ask_user:\(digest.map { String(format: "%02x", $0) }.joined())"
+                } else {
+                    questionKey = "ask_user"
+                }
+            }
+        }
+        return NormalizedEvent(session: session, permissionKey: callID ?? tool,
+                               updatesStatus: !copilotNotification || needsAttention, questionKey: questionKey)
     }
 
     private static func explicitMode(raw: [String: JSONValue], message: String?) -> AgentMode? {

@@ -143,6 +143,7 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
     public var remoteAgentName: String?
     public var remoteTerminalID: String?
     public var pendingPermissions: Set<String> = []
+    public var pendingQuestions: [String: Date]?
     // Only newly normalized, implicit PostToolUse events opt into completion inference.
     public var postToolUseSettlesAt: Date?
     public var copilotEventLog: String?
@@ -162,6 +163,10 @@ public struct AgentSession: Codable, Equatable, Identifiable, Sendable {
         if now.timeIntervalSince(observedAt) > timeout { return .idle }
         if remoteID != nil && (mode == .waiting || mode == .blocked) &&
             now.timeIntervalSince(updatedAt) > staleAfter { return .idle }
+        if mode.priority > AgentMode.waiting.priority,
+           pendingQuestions?.values.contains(where: { now.timeIntervalSince($0) <= staleAfter }) == true {
+            return .waiting
+        }
         if remoteID == nil, event == "PostToolUse", mode == .working, pendingPermissions.isEmpty,
            let settlesAt = postToolUseSettlesAt, now > settlesAt {
             return now.timeIntervalSince(settlesAt) > doneVisible ? .idle : .completed

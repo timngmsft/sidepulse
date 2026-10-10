@@ -247,6 +247,25 @@ final class BundleTests: XCTestCase {
         _ = try assertState("Ask")
         try runConfiguredCopilotHook("PostToolUse", identity)
         _ = try assertState("Working")
+        var form = identity
+        form["tool_name"] = .string("AskUserQuestion")
+        form["tool_input"] = .object([
+            "message": .string("Choose an environment"),
+            "requestedSchema": .object(["properties": .object(["environment": .object(["type": .string("string")])])])
+        ])
+        try runConfiguredCopilotHook("PreToolUse", form)
+        let desktopAsk = try assertState("Ask")
+        XCTAssertEqual(desktopAsk["sessions"]?.array?.first?["pendingQuestions"]?.object?.count, 1)
+        var otherTool = identity
+        otherTool["tool_name"] = .string("Bash")
+        try runConfiguredCopilotHook("PreToolUse", otherTool)
+        try runConfiguredCopilotHook("PostToolUse", otherTool)
+        _ = try assertState("Ask")
+        try runConfiguredCopilotHook("Stop", identity)
+        _ = try assertState("Ask")
+        try runConfiguredCopilotHook("PostToolUse", form)
+        let answered = try assertState("Working")
+        XCTAssertNil(answered["sessions"]?.array?.first?["pendingQuestions"])
         let transcript = root.appendingPathComponent("copilot-events.jsonl")
         try Data(#"{"type":"assistant.message","data":{"content":"Which environment should I use?"}}"#.utf8).write(to: transcript)
         var stop = identity

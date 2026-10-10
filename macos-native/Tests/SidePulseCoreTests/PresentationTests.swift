@@ -96,7 +96,8 @@ final class PresentationTests: XCTestCase {
             ("settling deadline", { $0.postToolUseSettlesAt = self.now.addingTimeInterval(120) }),
             ("Copilot event log", { $0.copilotEventLog = "/tmp/session-state/one/events.jsonl" }),
             ("Copilot activity watermark", { $0.copilotActivityAt = self.now }),
-            ("permission", { $0.pendingPermissions.insert("permission-one") })
+            ("permission", { $0.pendingPermissions.insert("permission-one") }),
+            ("question", { $0.pendingQuestions = ["question-one": self.now] })
         ]
         for (name, mutate) in mutations {
             var changed = session

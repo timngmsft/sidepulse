@@ -132,11 +132,17 @@ final class CopilotCancellationBundleTests: XCTestCase {
         XCTAssertEqual(session(working, id: "two")?["copilotEventLog"]?.string, try logFile("two").path)
 
         try send("UserPromptSubmit", id: "one")
-        try send("Notification", id: "two", fields: [
-            "notification_type": .string("elicitation_dialog"), "message": .string("Choose a target")
+        try send("PreToolUse", id: "two", fields: [
+            "tool_name": .string("AskUserQuestion"),
+            "tool_input": .object(["message": .string("Choose a target")])
         ])
         let asking = try waitFor("Ask", active: 2)
         XCTAssertEqual(asking["sessions"]?.array?.first?["sessionID"]?.string, "two")
+        XCTAssertEqual(session(asking, id: "two")?["pendingQuestions"]?.object?.count, 1)
+        _ = try request("quit")
+        process?.waitUntilExit()
+        try launch()
+        try waitFor("Ask", active: 2)
         try append("abort", id: "one")
         try waitFor("Ask", active: 1, cancelled: ["one"])
         try send("UserPromptSubmit", id: "two")

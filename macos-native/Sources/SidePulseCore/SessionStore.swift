@@ -18,11 +18,16 @@ public final class SessionStore {
     public func ingest(_ event: NormalizedEvent) -> Bool {
         guard event.updatesStatus else { return false }
         var incoming = event.session
-        if let previous = sessionsByID[incoming.id] {
+        if var previous = sessionsByID[incoming.id] {
             let cutoff = incoming.isCancelled ? previous.copilotCancellationCutoff : previous.updatedAt
-            guard incoming.updatedAt >= cutoff else { return false }
+            guard incoming.updatedAt >= cutoff else {
+                guard !previous.isCancelled, finishQuestion(event, in: &previous) else { return false }
+                sessionsByID[incoming.id] = previous
+                return true
+            }
             if previous.isCancelled, Self.copilotCleanupEvents.contains(incoming.event) { return false }
             incoming.pendingPermissions = previous.pendingPermissions
+            incoming.pendingQuestions = previous.pendingQuestions
             if incoming.cwd == nil { incoming.cwd = previous.cwd }
             if incoming.copilotEventLog == nil { incoming.copilotEventLog = previous.copilotEventLog }
             if incoming.isLocalCopilotSession {
@@ -39,17 +44,27 @@ public final class SessionStore {
         }
         if incoming.isCancelled {
             incoming.pendingPermissions.removeAll()
+            incoming.pendingQuestions = nil
             incoming.postToolUseSettlesAt = nil
             incoming.message = nil
             incoming.tool = nil
         } else if ["SessionStart", "UserPromptSubmit", "SessionEnd"].contains(incoming.event) {
             incoming.pendingPermissions.removeAll()
-        } else if incoming.event == "PermissionRequest" {
-            incoming.pendingPermissions.insert(event.permissionKey ?? "permission")
-        } else if ["PostToolUse", "PostToolUseFailure", "PermissionDenied"].contains(incoming.event),
-                  let key = event.permissionKey {
-            incoming.pendingPermissions.remove(key)
-            if incoming.pendingPermissions == ["permission"] { incoming.pendingPermissions.removeAll() }
+            incoming.pendingQuestions = nil
+        } else {
+            if incoming.event == "PermissionRequest" {
+                incoming.pendingPermissions.insert(event.permissionKey ?? "permission")
+            } else if ["PostToolUse", "PostToolUseFailure", "PermissionDenied"].contains(incoming.event),
+                      let key = event.permissionKey {
+                incoming.pendingPermissions.remove(key)
+                if incoming.pendingPermissions == ["permission"] { incoming.pendingPermissions.removeAll() }
+            }
+            if incoming.event == "PreToolUse", let key = event.questionKey {
+                if incoming.pendingQuestions == nil { incoming.pendingQuestions = [:] }
+                incoming.pendingQuestions?[key] = incoming.updatedAt
+            } else {
+                _ = finishQuestion(event, in: &incoming)
+            }
         }
         if !incoming.pendingPermissions.isEmpty && incoming.mode.priority > AgentMode.waiting.priority {
             incoming.mode = .waiting
@@ -58,6 +73,15 @@ public final class SessionStore {
         if sessionsByID.count > 256, let oldest = sessionsByID.values.min(by: { $0.observedAt < $1.observedAt }) {
             sessionsByID.removeValue(forKey: oldest.id)
         }
+        return true
+    }
+
+    private func finishQuestion(_ event: NormalizedEvent, in session: inout AgentSession) -> Bool {
+        guard ["PostToolUse", "PostToolUseFailure", "PermissionDenied"].contains(event.session.event),
+              let key = event.questionKey, let startedAt = session.pendingQuestions?[key],
+              event.session.updatedAt >= startedAt else { return false }
+        session.pendingQuestions?.removeValue(forKey: key)
+        if session.pendingQuestions?.isEmpty == true { session.pendingQuestions = nil }
         return true
     }
 
